@@ -631,9 +631,10 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, nlgEvalOb
                         masked_video=masked_video, video_labels_index=video_labels_index,
                         input_caption_ids=pairs_input_caption_ids, decoder_mask=pairs_decoder_mask,
                         output_caption_ids=pairs_output_caption_ids)
-            if n_gpu > 1:
-                loss = loss.mean()
-            total_loss += float(loss)
+            if loss is not None:
+                if n_gpu > 1:
+                    loss = loss.mean()
+                total_loss += float(loss)
             
             sequence_output, visual_output = model.get_sequence_visual_output(input_ids, segment_ids, input_mask, video, video_mask)
             # -- Repeat data for beam search

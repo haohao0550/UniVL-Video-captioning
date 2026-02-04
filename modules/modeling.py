@@ -268,7 +268,19 @@ class UniVL(UniVLPreTrainedModel):
 
             return loss
         else:
-            return None
+            # During evaluation, compute loss only for caption task with decoder
+            if (self._stage_two and 
+                input_caption_ids is not None and 
+                output_caption_ids is not None and
+                self.task_config.task_type == "caption"):
+                decoder_scores, res_tuples = self._get_decoder_score(sequence_output, visual_output,
+                                                                     input_ids, attention_mask, video_mask,
+                                                                     input_caption_ids, decoder_mask, shaped=True)
+                output_caption_ids = output_caption_ids.view(-1, output_caption_ids.shape[-1])
+                decoder_loss = self.decoder_loss_fct(decoder_scores.view(-1, self.bert_config.vocab_size), output_caption_ids.view(-1))
+                return decoder_loss
+            else:
+                return None
 
     def _calculate_mlm_loss(self, sequence_output_alm, pairs_token_labels):
         alm_scores = self.cls(sequence_output_alm)
