@@ -19,13 +19,16 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
         input_ids, input_mask, segment_ids, video, video_mask, \
         pairs_masked_text, pairs_token_labels, masked_video, video_labels_index,\
-        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids = batch
+        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
+        align_input_ids, align_mask, align_segment, sample_video_ids = batch
 
         output = model(input_ids, segment_ids, input_mask, video, video_mask,
                      pairs_masked_text=pairs_masked_text, pairs_token_labels=pairs_token_labels,
                      masked_video=masked_video, video_labels_index=video_labels_index,
                      input_caption_ids=pairs_input_caption_ids, decoder_mask=pairs_decoder_mask,
-                     output_caption_ids=pairs_output_caption_ids)
+                     output_caption_ids=pairs_output_caption_ids,
+                     align_input_ids=align_input_ids, align_mask=align_mask,
+                     align_segment=align_segment, sample_video_ids=sample_video_ids)
 
         # Support both dict and scalar output
         if isinstance(output, dict):

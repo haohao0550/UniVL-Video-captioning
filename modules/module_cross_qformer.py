@@ -469,9 +469,9 @@ class TemporalDynamicQFormerAdapter(nn.Module):
         # Registered at init time. If dims are unknown, LazyLinear keeps params registered.
         if input_dim is None:
             self.kv_proj = nn.LazyLinear(self.H)
-        elif input_dim == self.H:
-            self.kv_proj = nn.Identity()
         else:
+            # Always use a learnable projection (even when input_dim == H)
+            # so Q-Former can adapt encoder outputs to its own representation space.
             self.kv_proj = nn.Linear(input_dim, self.H)
 
         if instruction_dim is None:

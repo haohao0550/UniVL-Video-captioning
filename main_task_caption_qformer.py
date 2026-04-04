@@ -192,6 +192,16 @@ def get_args(description='UniVL Q-Former on Caption Task'):
 
     parser.add_argument('--stage_two', action='store_true', help="Whether training with decoder.")
 
+    parser.add_argument('--caption_prompt_mode', type=str, default='empty', choices=['empty', 'fixed'],
+                        help="Caption prompt mode for caption path BERT input: empty or fixed.")
+    parser.add_argument('--caption_prompt_text', type=str, default='What does the video describe?',
+                        help="Prompt text when caption_prompt_mode=fixed.")
+    parser.add_argument('--enforce_unique_video_train', type=int, default=1, choices=[0, 1],
+                        help="If 1, enforce at most one caption per video in each train epoch view.")
+    parser.add_argument('--train_caption_sampling_mode', type=str, default='per_video_random',
+                        choices=['all', 'per_video_random'],
+                        help="Train caption sampling: all captions or per-video random one-caption view.")
+
     # ── Q-Former-specific arguments ─────────────────────────────────────────
     parser.add_argument('--freeze_epochs', type=int, default=5,
                         help="Number of initial epochs to freeze bert+visual (default: 5). "
@@ -222,6 +232,15 @@ def get_args(description='UniVL Q-Former on Caption Task'):
                         help="Epochs to keep ITC/ITM weight at 0 (default: 1).")
     parser.add_argument('--it_aux_ramp_epochs', type=int, default=2,
                         help="Epochs to linearly ramp ITC/ITM weight to target (default: 2).")
+
+    parser.add_argument('--use_qformer_aux_loss', action='store_true',
+                        help="Enable auxiliary regularizers from Q-Former adapter.")
+    parser.add_argument('--qformer_diversity_weight', type=float, default=1e-2,
+                        help="Q-Former diversity regularizer weight.")
+    parser.add_argument('--qformer_sparsity_weight', type=float, default=1e-3,
+                        help="Q-Former sparsity regularizer weight.")
+    parser.add_argument('--qformer_temporal_weight', type=float, default=1e-3,
+                        help="Q-Former temporal smoothness regularizer weight.")
     # ────────────────────────────────────────────────────────────────────────
 
     args = parser.parse_args()
@@ -236,6 +255,7 @@ def get_args(description='UniVL Q-Former on Caption Task'):
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
+    args.enforce_unique_video_train = bool(args.enforce_unique_video_train)
 
     return args
 
@@ -251,6 +271,19 @@ def main():
     t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
     tokenizer = (bert_tokenizer, t5_tokenizer)
     # ────────────────────────────────────────────────────────────────────────
+
+    if args.local_rank == 0:
+        logger.info("Caption prompt config: mode=%s, text=%s",
+                    args.caption_prompt_mode,
+                    args.caption_prompt_text if args.caption_prompt_mode == 'fixed' else "<empty>")
+        logger.info("Train caption sampling config: enforce_unique_video_train=%s, mode=%s",
+                    args.enforce_unique_video_train, args.train_caption_sampling_mode)
+        if args.caption_prompt_mode == 'empty':
+            logger.warning("Caption prompt mode is EMPTY: model runs in video-only prompt baseline mode.")
+        if (args.use_itc_loss or args.use_itm_loss) and (not args.enforce_unique_video_train):
+            logger.warning("ITC/ITM enabled while enforce_unique_video_train=0; this can create false negatives.")
+        logger.info("Aux loss config: use_itc_loss=%s, use_itm_loss=%s, use_qformer_aux_loss=%s",
+                    args.use_itc_loss, args.use_itm_loss, args.use_qformer_aux_loss)
 
     # ── Model init (Solution B: cross.* weights are filtered out) ──────────
     model = init_model_qformer(args, device, n_gpu, args.local_rank, logger)
@@ -306,6 +339,8 @@ def main():
         best_output_model_file = None
         global_step = 0
         for epoch in range(args.epochs):
+            if hasattr(train_dataloader, 'dataset') and hasattr(train_dataloader.dataset, 'set_epoch'):
+                train_dataloader.dataset.set_epoch(epoch)
             train_sampler.set_epoch(epoch)
 
             # ── Update ITC / ITM loss weights (warmup + ramp) ────────────────

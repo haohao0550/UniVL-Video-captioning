@@ -27,23 +27,18 @@ def collect_active_part(beamed_tensor, curr_active_inst_idx, n_prev_active_inst,
 
 
 def collate_active_info(input_tuples, inst_idx_to_position_map, active_inst_idx_list, n_bm, device):
+    """Generically prune completed beam instances from all tensors in input_tuples."""
     assert isinstance(input_tuples, tuple)
-    sequence_output_rpt, visual_output_rpt, input_ids_rpt, input_mask_rpt, video_mask_rpt = input_tuples
-
     n_prev_active_inst = len(inst_idx_to_position_map)
     active_inst_idx = [inst_idx_to_position_map[k] for k in active_inst_idx_list]
     active_inst_idx = torch.LongTensor(active_inst_idx).to(device)
 
-    active_sequence_output_rpt = collect_active_part(sequence_output_rpt, active_inst_idx, n_prev_active_inst, n_bm)
-    active_visual_output_rpt = collect_active_part(visual_output_rpt, active_inst_idx, n_prev_active_inst, n_bm)
-    active_input_ids_rpt = collect_active_part(input_ids_rpt, active_inst_idx, n_prev_active_inst, n_bm)
-    active_input_mask_rpt = collect_active_part(input_mask_rpt, active_inst_idx, n_prev_active_inst, n_bm)
-    active_video_mask_rpt = collect_active_part(video_mask_rpt, active_inst_idx, n_prev_active_inst, n_bm)
+    active_tuples = tuple(
+        collect_active_part(t, active_inst_idx, n_prev_active_inst, n_bm)
+        for t in input_tuples
+    )
     active_inst_idx_to_position_map = get_inst_idx_to_tensor_position_map(active_inst_idx_list)
-
-    return (active_sequence_output_rpt, active_visual_output_rpt,
-            active_input_ids_rpt, active_input_mask_rpt, active_video_mask_rpt), \
-           active_inst_idx_to_position_map
+    return active_tuples, active_inst_idx_to_position_map
 
 
 def beam_decode_step(decoder, inst_dec_beams, len_dec_seq,
@@ -57,11 +52,11 @@ def beam_decode_step(decoder, inst_dec_beams, len_dec_seq,
         return dec_partial_seq
 
     def predict_word(next_decoder_ids, n_active_inst, n_bm, device, input_tuples):
-        sequence_output_rpt, visual_output_rpt, input_ids_rpt, input_mask_rpt, video_mask_rpt = input_tuples
+        cross_output_rpt, concat_mask_rpt = input_tuples
         next_decoder_mask = torch.ones(next_decoder_ids.size(), dtype=torch.uint8).to(device)
 
-        dec_output = decoder(sequence_output_rpt, visual_output_rpt, input_ids_rpt, input_mask_rpt,
-                             video_mask_rpt, next_decoder_ids, next_decoder_mask, shaped=True, get_logits=True)
+        dec_output = decoder(cross_output_rpt, concat_mask_rpt,
+                             next_decoder_ids, next_decoder_mask, get_logits=True)
         dec_output = dec_output[:, -1, :]
         word_prob = torch.nn.functional.log_softmax(dec_output, dim=1)
         word_prob = word_prob.view(n_active_inst, n_bm, -1)
@@ -122,14 +117,17 @@ def eval_epoch(args, model, test_dataloader, t5_tokenizer, device, n_gpu, logger
 
         input_ids, input_mask, segment_ids, video, video_mask, \
         pairs_masked_text, pairs_token_labels, masked_video, video_labels_index, \
-        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids = batch
+        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
+        align_input_ids, align_mask, align_segment, sample_video_ids = batch
 
         with torch.no_grad():
             loss = model(input_ids, segment_ids, input_mask, video, video_mask,
                          pairs_masked_text=pairs_masked_text, pairs_token_labels=pairs_token_labels,
                          masked_video=masked_video, video_labels_index=video_labels_index,
                          input_caption_ids=pairs_input_caption_ids, decoder_mask=pairs_decoder_mask,
-                         output_caption_ids=pairs_output_caption_ids)
+                         output_caption_ids=pairs_output_caption_ids,
+                         align_input_ids=align_input_ids, align_mask=align_mask,
+                         align_segment=align_segment, sample_video_ids=sample_video_ids)
             # Safety: handle both dict and scalar returns from model.
             # Dict may contain 'loss' (total) and 'decoder_loss'; we always
             # use decoder_loss for avg_val_loss to keep eval metric semantics.
@@ -145,19 +143,19 @@ def eval_epoch(args, model, test_dataloader, t5_tokenizer, device, n_gpu, logger
             n_bm = 5
             device = sequence_output.device
             n_inst, len_s, d_h = sequence_output.size()
-            _, len_v, v_h = visual_output.size()
 
-            decoder = model.decoder_caption
-
-            input_ids = input_ids.view(-1, input_ids.shape[-1])
             input_mask = input_mask.view(-1, input_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
 
-            sequence_output_rpt = sequence_output.repeat(1, n_bm, 1).view(n_inst * n_bm, len_s, d_h)
-            visual_output_rpt = visual_output.repeat(1, n_bm, 1).view(n_inst * n_bm, len_v, v_h)
-            input_ids_rpt = input_ids.repeat(1, n_bm).view(n_inst * n_bm, len_s)
-            input_mask_rpt = input_mask.repeat(1, n_bm).view(n_inst * n_bm, len_s)
-            video_mask_rpt = video_mask.repeat(1, n_bm).view(n_inst * n_bm, len_v)
+            # Compute cross output ONCE (Q-Former runs once, not per beam step)
+            cross_output, _, concat_mask = model._get_cross_output(
+                sequence_output, visual_output, input_mask, video_mask
+            )
+            K_cross = cross_output.size(1)
+            cross_output_rpt = cross_output.repeat(1, n_bm, 1).view(n_inst * n_bm, K_cross, d_h)
+            concat_mask_rpt = concat_mask.repeat(1, n_bm).view(n_inst * n_bm, K_cross)
+
+            decoder = model.decoder_caption_from_cross
 
             # Beam uses T5 BOS (pad=0) and EOS (</s>=1) via beam_t5.py
             inst_dec_beams = [Beam(n_bm, device=device, tokenizer=t5_tokenizer) for _ in range(n_inst)]
@@ -168,17 +166,14 @@ def eval_epoch(args, model, test_dataloader, t5_tokenizer, device, n_gpu, logger
                 active_inst_idx_list = beam_decode_step(
                     decoder, inst_dec_beams,
                     len_dec_seq, inst_idx_to_position_map, n_bm, device,
-                    (sequence_output_rpt, visual_output_rpt,
-                     input_ids_rpt, input_mask_rpt, video_mask_rpt)
+                    (cross_output_rpt, concat_mask_rpt)
                 )
                 if not active_inst_idx_list:
                     break
 
-                (sequence_output_rpt, visual_output_rpt,
-                 input_ids_rpt, input_mask_rpt, video_mask_rpt), \
+                (cross_output_rpt, concat_mask_rpt), \
                 inst_idx_to_position_map = collate_active_info(
-                    (sequence_output_rpt, visual_output_rpt,
-                     input_ids_rpt, input_mask_rpt, video_mask_rpt),
+                    (cross_output_rpt, concat_mask_rpt),
                     inst_idx_to_position_map, active_inst_idx_list, n_bm, device
                 )
 

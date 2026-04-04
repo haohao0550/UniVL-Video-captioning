@@ -153,8 +153,9 @@ class UniVL_T5(UniVLPreTrainedModel):
 
             if self.train_sim_after_cross is False:
                 # T5 Decoder ===>
-                show_log(task_config, "Loading T5-base decoder from HuggingFace...")
-                _t5_full = T5ForConditionalGeneration.from_pretrained("t5-base")
+                self.t5_model_name = getattr(task_config, 't5_model', 't5-base')
+                show_log(task_config, "Loading {} decoder from HuggingFace...".format(self.t5_model_name))
+                _t5_full = T5ForConditionalGeneration.from_pretrained(self.t5_model_name)
                 self.t5_decoder = _t5_full.decoder   # T5Stack (decoder)
                 self.t5_lm_head = _t5_full.lm_head   # Linear(768, 32128)
                 self.t5_vocab_size = _t5_full.config.vocab_size  # 32128
@@ -188,12 +189,26 @@ class UniVL_T5(UniVLPreTrainedModel):
                 self._use_itc = getattr(task_config, 'use_itc_loss', False)
                 self._use_itm = getattr(task_config, 'use_itm_loss', False)
                 self._itc_gather = getattr(task_config, 'itc_gather_distributed', False)
+                self._enforce_unique_video_train = getattr(task_config, 'enforce_unique_video_train', True)
+                self._train_caption_sampling_mode = getattr(task_config, 'train_caption_sampling_mode',
+                                                            'per_video_random')
 
                 if self._use_itc:
                     show_log(task_config, "ITC loss ENABLED (proj_dim={}, init_temp={:.3f})".format(
                         itc_proj_dim, init_temp))
                 if self._use_itm:
                     show_log(task_config, "ITM loss ENABLED (richer_fusion={})".format(use_richer))
+                if (self._use_itc or self._use_itm) and (
+                    (not self._enforce_unique_video_train)
+                    or (self._train_caption_sampling_mode != 'per_video_random')
+                ):
+                    logger.warning(
+                        "ITC/ITM enabled but unique-video train sampling is not strictly enforced "
+                        "(enforce_unique_video_train=%s, train_caption_sampling_mode=%s). "
+                        "This can introduce false negatives when a batch contains multiple captions per video.",
+                        self._enforce_unique_video_train,
+                        self._train_caption_sampling_mode,
+                    )
                 # ====== End ITC + ITM ======
 
             if self.task_config.do_pretrain:
@@ -222,8 +237,24 @@ class UniVL_T5(UniVLPreTrainedModel):
 
         # Storage for per-step loss metrics (read by trainer for logging)
         self._last_loss_dict = {}
+        self._warned_same_video_negative = False
+        self._warned_missing_align = False
 
-        self.apply(self.init_weights)
+        # Initialize only custom heads/layers; keep pretrained T5 weights untouched.
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        modules = [
+            getattr(self, 'similarity_dense', None),
+            getattr(self, 'itc_text_proj', None),
+            getattr(self, 'itc_video_proj', None),
+            getattr(self, 'itm_head', None),
+            getattr(self, 'cls', None),
+            getattr(self, 'cls_visual', None),
+        ]
+        for module in modules:
+            if module is not None:
+                module.apply(self.init_weights)
 
     # ====================================================================
     # ITC / ITM helper methods
@@ -296,70 +327,70 @@ class UniVL_T5(UniVLPreTrainedModel):
 
         return itc_loss, top1_acc, logit_scale.detach()
 
-    def _sample_hard_negatives(self, text_feat, video_feat, B):
-        """Select hard negative indices from ITC similarity.
-        Returns neg_text_idx: (B,) indices for negative text-video pairing.
-        All operations are detached (no gradient through selection)."""
+    def _sample_negative_indices(self, text_feat, video_feat, video_ids=None):
+        """Sample negative text indices for each video, preferring different-video negatives."""
+        B = text_feat.size(0)
+        if B <= 1:
+            return None
+
         with torch.no_grad():
             sim = F.normalize(text_feat, dim=-1) @ F.normalize(video_feat, dim=-1).t()  # (B, B)
-            sim.fill_diagonal_(-float('inf'))  # mask positives
+            sim.fill_diagonal_(-float('inf'))
 
-            itm_use_hard = getattr(self.task_config, 'itm_use_hard_negative', True) if hasattr(self, 'task_config') else True
-            if itm_use_hard and B > 2:
-                # For each video (column), pick text with highest similarity
-                neg_text_idx = sim.argmax(dim=0)  # (B,)
-                # Verify no diagonal selection (safety)
-                diag = torch.arange(B, device=sim.device)
-                collision = (neg_text_idx == diag)
-                if collision.any():
-                    # Fallback: for collisions, pick second-best
-                    sim_safe = sim.clone()
-                    sim_safe[neg_text_idx[collision], diag[collision]] = -float('inf')
-                    neg_text_idx[collision] = sim_safe[:, diag[collision]].argmax(dim=0)
-            else:
-                # Random shuffle fallback (also for batch_size <= 2)
-                neg_text_idx = torch.roll(torch.arange(B, device=text_feat.device), shifts=1)
+            if video_ids is not None:
+                same_video = (video_ids.unsqueeze(1) == video_ids.unsqueeze(0))
+                same_video.fill_diagonal_(False)
+                sim = sim.masked_fill(same_video, -float('inf'))
 
-        return neg_text_idx
+            neg_idx = sim.argmax(dim=0)
+            valid = torch.isfinite(sim.max(dim=0).values)
 
-    def _compute_itm_loss(self, sequence_output, visual_output, attention_mask, video_mask,
-                           text_feat, video_feat, cross_output_pos, pooled_output_pos):
-        """Image-Text Matching loss with hard negative mining.
-        Positive: existing Q-Former output from caption path.
-        Negative: re-run Q-Former with mismatched text-video pairs.
-        Returns: itm_loss, itm_acc, pos_score_mean, neg_score_mean (all detached except loss)."""
+            if not valid.all():
+                fallback = torch.roll(torch.arange(B, device=text_feat.device), shifts=1)
+                if video_ids is not None:
+                    for i in range(B):
+                        if valid[i]:
+                            continue
+                        candidates = torch.nonzero(video_ids != video_ids[i], as_tuple=False).squeeze(-1)
+                        if candidates.numel() > 0:
+                            fallback[i] = candidates[0]
+                        else:
+                            fallback[i] = (i + 1) % B
+                            if not self._warned_same_video_negative:
+                                logger.warning(
+                                    "ITM negative sampling fallback: batch appears to contain only same-video captions; "
+                                    "this may introduce false negatives for ITC/ITM."
+                                )
+                                self._warned_same_video_negative = True
+                neg_idx = torch.where(valid, neg_idx, fallback)
+
+        return neg_idx
+
+    def _compute_itm_loss(self, text_feat, video_feat, video_ids=None):
+        """Embedding-pair ITM loss on (text_feat_align, video_feat) without re-running caption cross path."""
         B = text_feat.size(0)
+        neg_text_idx = self._sample_negative_indices(text_feat, video_feat, video_ids=video_ids)
+        if neg_text_idx is None:
+            zero = torch.tensor(0.0, device=text_feat.device)
+            return zero, zero, zero, zero
 
-        # --- Positive ITM features ---
-        itm_feat_pos = self._build_itm_features(pooled_output_pos, text_feat)  # (B, feat_dim)
+        itm_feat_pos = self._build_itm_features(video_feat, text_feat)
+        itm_feat_neg = self._build_itm_features(video_feat, text_feat[neg_text_idx])
 
-        # --- Negative pairs: select hard negatives ---
-        neg_text_idx = self._sample_hard_negatives(text_feat, video_feat, B)
-
-        # Re-run Q-Former with mismatched text + original video
-        _, pooled_neg, _ = self._get_cross_output(
-            sequence_output[neg_text_idx], visual_output,
-            attention_mask[neg_text_idx], video_mask
-        )
-        text_feat_neg = text_feat[neg_text_idx]
-        itm_feat_neg = self._build_itm_features(pooled_neg, text_feat_neg)  # (B, feat_dim)
-
-        # --- Classify ---
-        itm_input = torch.cat([itm_feat_pos, itm_feat_neg], dim=0)  # (2B, feat_dim)
+        itm_input = torch.cat([itm_feat_pos, itm_feat_neg], dim=0)
         itm_labels = torch.cat([
             torch.ones(B, device=text_feat.device, dtype=torch.long),
             torch.zeros(B, device=text_feat.device, dtype=torch.long)
-        ])  # (2B,)
+        ], dim=0)
 
-        itm_logits = self.itm_head(itm_input)  # (2B, 2)
+        itm_logits = self.itm_head(itm_input)
         itm_loss = F.cross_entropy(itm_logits, itm_labels)
 
-        # --- Logging metrics (detached) ---
         with torch.no_grad():
             itm_pred = itm_logits.argmax(dim=-1)
             itm_acc = (itm_pred == itm_labels).float().mean()
-            pos_scores = F.softmax(itm_logits[:B], dim=-1)[:, 1]  # P(match) for positives
-            neg_scores = F.softmax(itm_logits[B:], dim=-1)[:, 1]  # P(match) for negatives
+            pos_scores = F.softmax(itm_logits[:B], dim=-1)[:, 1]
+            neg_scores = F.softmax(itm_logits[B:], dim=-1)[:, 1]
             pos_mean = pos_scores.mean()
             neg_mean = neg_scores.mean()
 
@@ -382,11 +413,20 @@ class UniVL_T5(UniVLPreTrainedModel):
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None,
                 pairs_masked_text=None, pairs_token_labels=None, masked_video=None, video_labels_index=None,
-                input_caption_ids=None, decoder_mask=None, output_caption_ids=None):
+                input_caption_ids=None, decoder_mask=None, output_caption_ids=None,
+                align_input_ids=None, align_mask=None, align_segment=None,
+                prompt_input_ids=None, prompt_mask=None, prompt_segment=None,
+                sample_video_ids=None):
 
-        input_ids = input_ids.view(-1, input_ids.shape[-1])
-        token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
-        attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+        # Caption path text (prompt only). If explicit prompt_* is absent, reuse input_* tensors.
+        prompt_input_ids = prompt_input_ids if prompt_input_ids is not None else input_ids
+        prompt_mask = prompt_mask if prompt_mask is not None else attention_mask
+        prompt_segment = prompt_segment if prompt_segment is not None else token_type_ids
+
+        prompt_input_ids = prompt_input_ids.view(-1, prompt_input_ids.shape[-1])
+        prompt_segment = prompt_segment.view(-1, prompt_segment.shape[-1])
+        prompt_mask = prompt_mask.view(-1, prompt_mask.shape[-1])
+
         video_mask = video_mask.view(-1, video_mask.shape[-1])
         video = self.normalize_video(video)
 
@@ -394,20 +434,42 @@ class UniVL_T5(UniVLPreTrainedModel):
             input_caption_ids = input_caption_ids.view(-1, input_caption_ids.shape[-1])
             decoder_mask = decoder_mask.view(-1, decoder_mask.shape[-1])
 
-        sequence_output, visual_output = self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
-                                                                         video, video_mask, shaped=True)
+        if align_input_ids is not None:
+            align_input_ids = align_input_ids.view(-1, align_input_ids.shape[-1])
+            align_mask = align_mask.view(-1, align_mask.shape[-1])
+            align_segment = align_segment.view(-1, align_segment.shape[-1])
+
+        if sample_video_ids is not None:
+            sample_video_ids = sample_video_ids.view(-1)
+
+        sequence_output_prompt, visual_output = self.get_sequence_visual_output(
+            prompt_input_ids, prompt_segment, prompt_mask, video, video_mask, shaped=True
+        )
+
+        # Alignment path is intentionally separate from caption decoder path to avoid leakage.
+        sequence_output_align = None
+        if align_input_ids is not None:
+            encoded_layers_align, _ = self.bert(
+                align_input_ids, align_segment, align_mask, output_all_encoded_layers=True
+            )
+            sequence_output_align = encoded_layers_align[-1]
 
         if self.training:
             loss = 0.
             if self._stage_one:
-                sim_matrix = self.get_similarity_logits(sequence_output, visual_output, attention_mask,
+                sim_matrix = self.get_similarity_logits(sequence_output_prompt, visual_output, prompt_mask,
                                                         video_mask, shaped=True)
                 sim_loss = self.loss_fct(sim_matrix)
                 loss += sim_loss
 
             if self._stage_two:
-                # ── Pre-compute text_feat for ITC/ITM (reused across losses) ──
-                text_feat = self._masked_mean_pool_text(sequence_output, attention_mask)  # (B, H)
+                # Alignment path text features (caption_gt only, never fed to decoder cross path).
+                text_feat_align = None
+                if sequence_output_align is not None:
+                    text_feat_align = self._masked_mean_pool_text(sequence_output_align, align_mask)
+                elif (self._use_itc or self._use_itm) and not self._warned_missing_align:
+                    logger.warning("ITC/ITM is enabled but align_* tensors are missing. Auxiliary losses are skipped.")
+                    self._warned_missing_align = True
 
                 if self.task_config.do_pretrain:
                     pairs_masked_text = pairs_masked_text.view(-1, pairs_masked_text.shape[-1])
@@ -416,13 +478,18 @@ class UniVL_T5(UniVLPreTrainedModel):
                     masked_video = self.normalize_video(masked_video)
                     video_labels_index = video_labels_index.view(-1, video_labels_index.shape[-1])
 
-                    sequence_output_alm, visual_output_alm = self.get_sequence_visual_output(pairs_masked_text, token_type_ids,
-                                                                                             attention_mask, masked_video, video_mask, shaped=True)
+                    sequence_output_alm, visual_output_alm = self.get_sequence_visual_output(
+                        pairs_masked_text, prompt_segment, prompt_mask, masked_video, video_mask, shaped=True
+                    )
 
-                    cross_output, pooled_output, concat_mask = self._get_cross_output(sequence_output_alm, visual_output_alm, attention_mask, video_mask)
-                    expected_concat_len = attention_mask.size(-1) + video_mask.size(-1)
+                    cross_output, pooled_output, concat_mask = self._get_cross_output(
+                        sequence_output_alm, visual_output_alm, prompt_mask, video_mask
+                    )
+                    expected_concat_len = prompt_mask.size(-1) + video_mask.size(-1)
                     if cross_output.size(1) == expected_concat_len:
-                        sequence_cross_output, visual_cross_output = torch.split(cross_output, [attention_mask.size(-1), video_mask.size(-1)], dim=1)
+                        sequence_cross_output, visual_cross_output = torch.split(
+                            cross_output, [prompt_mask.size(-1), video_mask.size(-1)], dim=1
+                        )
                         alm_loss = self._calculate_mlm_loss(sequence_cross_output, pairs_token_labels)
                         loss += alm_loss
                         nce_loss = self._calculate_mfm_loss(visual_cross_output, video, video_mask, video_labels_index)
@@ -431,13 +498,13 @@ class UniVL_T5(UniVLPreTrainedModel):
                         logger.warning("Q-Former cross output shape (%s) != concat length (%d). "
                                        "Skipping MLM/MFM pretrain losses.", cross_output.shape, expected_concat_len)
 
-                    sim_matrix = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
+                    sim_matrix = self.get_similarity_logits(sequence_output_prompt, visual_output, prompt_mask, video_mask,
                                                             shaped=True, _pretrain_joint=True)
                     sim_loss_joint = self._pretrain_sim_loss_fct(sim_matrix)
                     loss += sim_loss_joint
 
                 # ── Decoder (caption) loss ──
-                decoder_loss = torch.tensor(0.0, device=input_ids.device)
+                decoder_loss = torch.tensor(0.0, device=prompt_input_ids.device)
                 cross_output_pos = None
                 pooled_output_pos = None
                 encoder_mask_pos = None
@@ -447,18 +514,15 @@ class UniVL_T5(UniVLPreTrainedModel):
                          or (self.task_config.do_pretrain is False and self.task_config.task_type == "caption")):
                     if self.task_config.do_pretrain:
                         decoder_scores, res_tuples = self._get_decoder_score(sequence_output_alm, visual_output_alm,
-                                                                             input_ids, attention_mask, video_mask,
+                                                                             prompt_input_ids, prompt_mask, video_mask,
                                                                              input_caption_ids, decoder_mask, shaped=True)
                     elif self.task_config.task_type == "caption":
-                        decoder_scores, res_tuples = self._get_decoder_score(sequence_output, visual_output,
-                                                                             input_ids, attention_mask, video_mask,
-                                                                             input_caption_ids, decoder_mask, shaped=True)
-                        # Capture cross_output from the decoder path for ITC/ITM reuse
-                        # _get_decoder_score already called _get_cross_output internally,
-                        # so we re-call here to get pooled_output for ITC/ITM.
-                        # This is a second forward through cross encoder for this batch.
+                        # Caption path: prompt + video -> Q-Former -> T5 decoder.
                         cross_output_pos, pooled_output_pos, encoder_mask_pos = self._get_cross_output(
-                            sequence_output, visual_output, attention_mask, video_mask
+                            sequence_output_prompt, visual_output, prompt_mask, video_mask
+                        )
+                        decoder_scores = self._get_decoder_score_from_cross(
+                            cross_output_pos, encoder_mask_pos, input_caption_ids, decoder_mask
                         )
                     else:
                         raise NotImplementedError
@@ -471,11 +535,11 @@ class UniVL_T5(UniVLPreTrainedModel):
                     loss += decoder_loss
 
                 # ── ITC loss ──
-                itc_loss = torch.tensor(0.0, device=input_ids.device)
-                itc_top1 = torch.tensor(0.0, device=input_ids.device)
-                itc_temp = torch.tensor(0.0, device=input_ids.device)
+                itc_loss = torch.tensor(0.0, device=prompt_input_ids.device)
+                itc_top1 = torch.tensor(0.0, device=prompt_input_ids.device)
+                itc_temp = torch.tensor(0.0, device=prompt_input_ids.device)
 
-                if self._use_itc:
+                if self._use_itc and text_feat_align is not None:
                     # Video embedding from Q-Former (post cross-encoder)
                     if pooled_output_pos is not None:
                         video_feat = self._get_qformer_video_embedding(
@@ -483,48 +547,59 @@ class UniVL_T5(UniVLPreTrainedModel):
                     else:
                         # Fallback: run cross encoder if not yet computed
                         co, po, em = self._get_cross_output(
-                            sequence_output, visual_output, attention_mask, video_mask)
+                            sequence_output_prompt, visual_output, prompt_mask, video_mask)
                         video_feat = self._get_qformer_video_embedding(co, po, em)
                         cross_output_pos, pooled_output_pos, encoder_mask_pos = co, po, em
 
-                    itc_loss, itc_top1, itc_temp = self._compute_itc_loss(text_feat, video_feat)
+                    itc_loss, itc_top1, itc_temp = self._compute_itc_loss(text_feat_align, video_feat)
 
                     current_itc_weight = getattr(self.task_config, 'current_itc_weight',
                                                  getattr(self.task_config, 'itc_weight', 0.05))
                     loss += current_itc_weight * itc_loss
 
                 # ── ITM loss ──
-                itm_loss = torch.tensor(0.0, device=input_ids.device)
-                itm_acc = torch.tensor(0.0, device=input_ids.device)
-                itm_pos_mean = torch.tensor(0.0, device=input_ids.device)
-                itm_neg_mean = torch.tensor(0.0, device=input_ids.device)
+                itm_loss = torch.tensor(0.0, device=prompt_input_ids.device)
+                itm_acc = torch.tensor(0.0, device=prompt_input_ids.device)
+                itm_pos_mean = torch.tensor(0.0, device=prompt_input_ids.device)
+                itm_neg_mean = torch.tensor(0.0, device=prompt_input_ids.device)
 
-                if self._use_itm and text_feat.size(0) > 1:
+                if self._use_itm and text_feat_align is not None and text_feat_align.size(0) > 1:
                     if pooled_output_pos is None:
                         co, po, em = self._get_cross_output(
-                            sequence_output, visual_output, attention_mask, video_mask)
+                            sequence_output_prompt, visual_output, prompt_mask, video_mask)
                         cross_output_pos, pooled_output_pos, encoder_mask_pos = co, po, em
 
                     video_feat_itm = self._get_qformer_video_embedding(
                         cross_output_pos, pooled_output_pos, encoder_mask_pos)
 
                     itm_loss, itm_acc, itm_pos_mean, itm_neg_mean = self._compute_itm_loss(
-                        sequence_output, visual_output, attention_mask, video_mask,
-                        text_feat, video_feat_itm, cross_output_pos, pooled_output_pos
+                        text_feat_align, video_feat_itm, video_ids=sample_video_ids
                     )
 
                     current_itm_weight = getattr(self.task_config, 'current_itm_weight',
                                                  getattr(self.task_config, 'itm_weight', 0.05))
                     loss += current_itm_weight * itm_loss
 
+                # Optional Q-Former auxiliary regularizers from module_cross_qformer.
+                qformer_aux_loss = torch.tensor(0.0, device=prompt_input_ids.device)
+                if getattr(self.task_config, 'use_qformer_aux_loss', False) and hasattr(self.cross, 'auxiliary_losses'):
+                    aux_losses = self.cross.auxiliary_losses(
+                        diversity_weight=getattr(self.task_config, 'qformer_diversity_weight', 1e-2),
+                        sparsity_weight=getattr(self.task_config, 'qformer_sparsity_weight', 1e-3),
+                        temporal_weight=getattr(self.task_config, 'qformer_temporal_weight', 1e-3),
+                    )
+                    if aux_losses:
+                        qformer_aux_loss = sum(aux_losses.values())
+                        loss += qformer_aux_loss
+
                 # ── Retrieval loss (existing, for pretrain/retrieval tasks) ──
                 if self.task_config.do_pretrain or self.task_config.task_type == "retrieval":
                     if self.task_config.do_pretrain:
                         sim_matrix_text_visual = self.get_similarity_logits(sequence_output_alm, visual_output_alm,
-                                                                            attention_mask, video_mask, shaped=True)
+                                                                            prompt_mask, video_mask, shaped=True)
                     elif self.task_config.task_type == "retrieval":
-                        sim_matrix_text_visual = self.get_similarity_logits(sequence_output, visual_output,
-                                                                            attention_mask, video_mask, shaped=True)
+                        sim_matrix_text_visual = self.get_similarity_logits(sequence_output_prompt, visual_output,
+                                                                            prompt_mask, video_mask, shaped=True)
                     else:
                         raise NotImplementedError
 
@@ -542,6 +617,7 @@ class UniVL_T5(UniVLPreTrainedModel):
                     "itc_top1": itc_top1.detach() if torch.is_tensor(itc_top1) else itc_top1,
                     "itm_pos_mean": itm_pos_mean.detach() if torch.is_tensor(itm_pos_mean) else itm_pos_mean,
                     "itm_neg_mean": itm_neg_mean.detach() if torch.is_tensor(itm_neg_mean) else itm_neg_mean,
+                    "qformer_aux_loss": qformer_aux_loss.detach(),
                 }
 
             # Return dict in training mode
@@ -553,8 +629,8 @@ class UniVL_T5(UniVLPreTrainedModel):
                 input_caption_ids is not None and
                 output_caption_ids is not None and
                 self.task_config.task_type == "caption"):
-                decoder_scores, res_tuples = self._get_decoder_score(sequence_output, visual_output,
-                                                                     input_ids, attention_mask, video_mask,
+                decoder_scores, res_tuples = self._get_decoder_score(sequence_output_prompt, visual_output,
+                                                                     prompt_input_ids, prompt_mask, video_mask,
                                                                      input_caption_ids, decoder_mask, shaped=True)
                 output_caption_ids = output_caption_ids.view(-1, output_caption_ids.shape[-1])
                 decoder_loss = self.decoder_loss_fct(
@@ -721,6 +797,16 @@ class UniVL_T5(UniVLPreTrainedModel):
 
         return decoder_scores, res_tuples
 
+    def _get_decoder_score_from_cross(self, cross_output, encoder_mask, input_caption_ids, decoder_mask):
+        """Run T5 decoder with pre-computed cross-encoder output (no Q-Former call)."""
+        t5_output = self.t5_decoder(
+            input_ids=input_caption_ids,
+            attention_mask=decoder_mask,
+            encoder_hidden_states=cross_output,
+            encoder_attention_mask=encoder_mask,
+        )
+        return self.t5_lm_head(t5_output.last_hidden_state)
+
     def decoder_caption(self, sequence_output, visual_output, input_ids, attention_mask, video_mask,
                         input_caption_ids, decoder_mask, shaped=False, get_logits=False):
         if shaped is False:
@@ -737,5 +823,15 @@ class UniVL_T5(UniVLPreTrainedModel):
         if get_logits:
             return decoder_scores
 
+        _, decoder_scores_result = torch.max(decoder_scores, -1)
+        return decoder_scores_result
+
+    def decoder_caption_from_cross(self, cross_output, encoder_mask,
+                                   input_caption_ids, decoder_mask, get_logits=False):
+        """Beam search entry point: T5 decoder with pre-computed cross output (skips Q-Former)."""
+        decoder_scores = self._get_decoder_score_from_cross(
+            cross_output, encoder_mask, input_caption_ids, decoder_mask)
+        if get_logits:
+            return decoder_scores
         _, decoder_scores_result = torch.max(decoder_scores, -1)
         return decoder_scores_result

@@ -73,8 +73,16 @@ def dataloader_msrvtt_train(args, tokenizer):
         max_words=args.max_words,
         feature_framerate=args.feature_framerate,
         max_frames=args.max_frames,
+        caption_prompt_mode=getattr(args, "caption_prompt_mode", "empty"),
+        caption_prompt_text=getattr(args, "caption_prompt_text", "What does the video describe?"),
+        enforce_unique_video_train=getattr(args, "enforce_unique_video_train", True),
+        train_caption_sampling_mode=getattr(args, "train_caption_sampling_mode", "per_video_random"),
         split_type="train",
     )
+
+    # Initialize caption sampling view before constructing DistributedSampler.
+    if hasattr(msrvtt_dataset, "set_epoch"):
+        msrvtt_dataset.set_epoch(0)
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(msrvtt_dataset)
     dataloader = DataLoader(
@@ -104,6 +112,8 @@ def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test"):
         max_words=args.max_words,
         feature_framerate=args.feature_framerate,
         max_frames=args.max_frames,
+        caption_prompt_mode=getattr(args, "caption_prompt_mode", "empty"),
+        caption_prompt_text=getattr(args, "caption_prompt_text", "What does the video describe?"),
         split_type=split_type,
     )
 
