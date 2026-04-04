@@ -1,8 +1,0 @@
-.git
-.idea
-data/msrvtt/msrvtt_videos_features.pickle
-venv
-__pycache__
-.DS_Store
-ckpts
-msrvtt_clip_vitl14_features.pickle

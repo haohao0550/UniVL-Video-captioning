@@ -30,7 +30,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from modules.until_module import PreTrainedModel, LayerNorm, CrossEn, MILNCELoss, MaxMarginRankingLoss
 from modules.module_bert import BertModel, BertConfig, BertOnlyMLMHead
 from modules.module_visual import VisualModel, VisualConfig, VisualOnlyMLMHead
-from modules.module_cross_qformer import CrossModel, CrossConfig
+from modules.module_cross import CrossModel, CrossConfig
 from modules.module_decoder import DecoderModel, DecoderConfig
 
 logger = logging.getLogger(__name__)
@@ -223,19 +223,13 @@ class UniVL(UniVLPreTrainedModel):
                                                                                              attention_mask, masked_video, video_mask, shaped=True)
 
                     cross_output, pooled_output, concat_mask = self._get_cross_output(sequence_output_alm, visual_output_alm, attention_mask, video_mask)
-                    # Q-Former output shape is (B, K, H) which differs from concat length.
-                    # MLM/MFM losses require per-token aligned output, so only run them
-                    # when the cross encoder returns concat-length output (i.e. old CrossModel).
-                    expected_concat_len = attention_mask.size(-1) + video_mask.size(-1)
-                    if cross_output.size(1) == expected_concat_len:
-                        sequence_cross_output, visual_cross_output = torch.split(cross_output, [attention_mask.size(-1), video_mask.size(-1)], dim=1)
-                        alm_loss = self._calculate_mlm_loss(sequence_cross_output, pairs_token_labels)
-                        loss += alm_loss
-                        nce_loss = self._calculate_mfm_loss(visual_cross_output, video, video_mask, video_labels_index)
-                        loss += nce_loss
-                    else:
-                        logger.warning("Q-Former cross output shape (%s) != concat length (%d). "
-                                       "Skipping MLM/MFM pretrain losses.", cross_output.shape, expected_concat_len)
+                    sequence_cross_output, visual_cross_output = torch.split(cross_output, [attention_mask.size(-1), video_mask.size(-1)], dim=1)
+
+                    alm_loss = self._calculate_mlm_loss(sequence_cross_output, pairs_token_labels)
+                    loss += alm_loss
+
+                    nce_loss = self._calculate_mfm_loss(visual_cross_output, video, video_mask, video_labels_index)
+                    loss += nce_loss
 
                     sim_matrix = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
                                                             shaped=True, _pretrain_joint=True)
@@ -341,23 +335,7 @@ class UniVL(UniVLPreTrainedModel):
         cross_layers, pooled_output = self.cross(concat_features, concat_type, concat_mask, output_all_encoded_layers=True)
         cross_output = cross_layers[-1]
 
-        # Build encoder_mask that matches cross_output seq dimension.
-        # For Q-Former, output is (B, K, H) instead of (B, concat_len, H),
-        # so we need a query-length mask instead of concat_mask.
-        if cross_output.size(1) != concat_mask.size(1):
-            # Q-Former path: use query_mask from aux if available
-            if hasattr(self.cross, 'get_last_aux'):
-                aux = self.cross.get_last_aux()
-                encoder_mask = aux.get('query_mask', None)
-            else:
-                encoder_mask = None
-            if encoder_mask is None:
-                B, K = cross_output.shape[:2]
-                encoder_mask = torch.ones(B, K, device=cross_output.device, dtype=concat_mask.dtype)
-        else:
-            encoder_mask = concat_mask
-
-        return cross_output, pooled_output, encoder_mask
+        return cross_output, pooled_output, concat_mask
 
     def _mean_pooling_for_similarity(self, sequence_output, visual_output, attention_mask, video_mask,):
         attention_mask_un = attention_mask.to(dtype=torch.float).unsqueeze(-1)
