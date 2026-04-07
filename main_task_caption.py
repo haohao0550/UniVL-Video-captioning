@@ -132,6 +132,7 @@ def main():
     else:
         tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     model = init_model(args, device, n_gpu, args.local_rank)
+    is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
 
     assert args.task_type == "caption"
     
@@ -177,6 +178,9 @@ def main():
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                                                scheduler, global_step, logger, local_rank=args.local_rank)
 
+            if is_distributed:
+                torch.distributed.barrier()
+
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
                 output_model_file = save_model(epoch, args, model, logger, type_name="")
@@ -189,9 +193,14 @@ def main():
                 else:
                     logger.warning("Skip the evaluation after {}-th epoch.".format(epoch+1))
 
+            if is_distributed:
+                torch.distributed.barrier()
+
         if args.local_rank == 0:
             model = load_model(-1, args, n_gpu, device, logger, model_file=best_output_model_file)
             Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
+        if is_distributed:
+            torch.distributed.barrier()
     elif args.do_eval:
         if args.local_rank == 0:
             Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
