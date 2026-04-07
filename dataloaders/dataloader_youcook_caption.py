@@ -36,6 +36,9 @@ class Youcook_Caption_DataLoader(Dataset):
         self.tokenizer = tokenizer
 
         self.feature_size = self.feature_dict[self.csv["feature_file"].values[0]].shape[-1]
+        self.pad_id = self._get_token_id(['pad_token_id'], default=0)
+        self.bos_id = self._get_token_id(['cls_token_id', 'bos_token_id'], default=self.pad_id)
+        self.eos_id = self._get_token_id(['sep_token_id', 'eos_token_id'], default=self.pad_id)
 
         # Get iterator video ids
         video_id_list = [itm for itm in self.csv['video_id'].values]
@@ -49,6 +52,19 @@ class Youcook_Caption_DataLoader(Dataset):
             for sub_id in range(n_caption):
                 self.iter2video_pairs_dict[iter_idx_] = (video_id, sub_id)
                 iter_idx_ += 1
+
+    def _get_token_id(self, names, default=0):
+        for n in names:
+            if hasattr(self.tokenizer, n):
+                v = getattr(self.tokenizer, n)
+                if v is not None:
+                    return int(v)
+        return int(default)
+
+    def _encode_text(self, text):
+        tokens = self.tokenizer.tokenize(text)
+        ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        return ids
 
     def __len__(self):
         return len(self.iter2video_pairs_dict)
@@ -74,57 +90,21 @@ class Youcook_Caption_DataLoader(Dataset):
             ind = r_ind[i]
             start_, end_ = data_dict['start'][ind], data_dict['end'][ind]
             starts[i], ends[i] = start_, end_
-            total_length_with_CLS = self.max_words - 1
-            words = self.tokenizer.tokenize(data_dict['transcript'][ind])
+            total_length_with_BOS_EOS = self.max_words - 2
+            text_ids = self._encode_text(data_dict['transcript'][ind])
 
-            words = ["[CLS]"] + words
-            if len(words) > total_length_with_CLS:
-                words = words[:total_length_with_CLS]
-            words = words + ["[SEP]"]
-
-            # Mask Language Model <-----
-            token_labels = []
-            masked_tokens = words.copy()
-            for token_id, token in enumerate(masked_tokens):
-                if token_id == 0 or token_id == len(masked_tokens) - 1:
-                    token_labels.append(-1)
-                    continue
-                prob = random.random()
-                # mask token with 15% probability
-                if prob < 0.15:
-                    prob /= 0.15
-
-                    # 80% randomly change token to mask token
-                    if prob < 0.8:
-                        masked_tokens[token_id] = "[MASK]"
-
-                    # 10% randomly change token to random token
-                    elif prob < 0.9:
-                        masked_tokens[token_id] = random.choice(list(self.tokenizer.vocab.items()))[0]
-
-                    # -> rest 10% randomly keep current token
-
-                    # append current token to output (we will predict these later)
-                    try:
-                        token_labels.append(self.tokenizer.vocab[token])
-                    except KeyError:
-                        # For unknown words (should not occur with BPE vocab)
-                        token_labels.append(self.tokenizer.vocab["[UNK]"])
-                        # print("Cannot find token '{}' in vocab. Using [UNK] insetad".format(token))
-                else:
-                    # no masking token (will be ignored by loss function later)
-                    token_labels.append(-1)
-            # -----> Mask Language Model
-
-            input_ids = self.tokenizer.convert_tokens_to_ids(words)
-            masked_token_ids = self.tokenizer.convert_tokens_to_ids(masked_tokens)
+            if len(text_ids) > total_length_with_BOS_EOS:
+                text_ids = text_ids[:total_length_with_BOS_EOS]
+            input_ids = [self.bos_id] + text_ids + [self.eos_id]
+            masked_token_ids = input_ids.copy()
+            token_labels = [-1] * len(input_ids)
             input_mask = [1] * len(input_ids)
             segment_ids = [0] * len(input_ids)
             while len(input_ids) < self.max_words:
-                input_ids.append(0)
+                input_ids.append(self.pad_id)
                 input_mask.append(0)
                 segment_ids.append(0)
-                masked_token_ids.append(0)
+                masked_token_ids.append(self.pad_id)
                 token_labels.append(-1)
             assert len(input_ids) == self.max_words
             assert len(input_mask) == self.max_words
@@ -139,19 +119,17 @@ class Youcook_Caption_DataLoader(Dataset):
             pairs_token_labels[i] = np.array(token_labels)
 
             # For generate captions
-            caption_words = self.tokenizer.tokenize(data_dict['text'][ind])
-            if len(caption_words) > total_length_with_CLS:
-                caption_words = caption_words[:total_length_with_CLS]
-            input_caption_words = ["[CLS]"] + caption_words
-            output_caption_words = caption_words + ["[SEP]"]
+            caption_ids = self._encode_text(data_dict['text'][ind])
+            if len(caption_ids) > self.max_words - 1:
+                caption_ids = caption_ids[:self.max_words - 1]
+            input_caption_ids = [self.bos_id] + caption_ids
+            output_caption_ids = caption_ids + [self.eos_id]
 
             # For generate captions
-            input_caption_ids = self.tokenizer.convert_tokens_to_ids(input_caption_words)
-            output_caption_ids = self.tokenizer.convert_tokens_to_ids(output_caption_words)
             decoder_mask = [1] * len(input_caption_ids)
             while len(input_caption_ids) < self.max_words:
-                input_caption_ids.append(0)
-                output_caption_ids.append(0)
+                input_caption_ids.append(self.pad_id)
+                output_caption_ids.append(self.pad_id)
                 decoder_mask.append(0)
             assert len(input_caption_ids) == self.max_words
             assert len(output_caption_ids) == self.max_words

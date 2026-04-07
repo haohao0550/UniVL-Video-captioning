@@ -32,6 +32,10 @@ from modules.module_bert import BertModel, BertConfig, BertOnlyMLMHead
 from modules.module_visual import VisualModel, VisualConfig, VisualOnlyMLMHead
 from modules.module_cross import CrossModel, CrossConfig
 from modules.module_decoder import DecoderModel, DecoderConfig
+try:
+    from modules.module_decoder_flan_t5 import FlanT5Decoder
+except Exception:
+    FlanT5Decoder = None
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +131,9 @@ class UniVL(UniVLPreTrainedModel):
         show_log(task_config, "Stage-One:{}, Stage-Two:{}".format(self._stage_one, self._stage_two))
 
         self.train_sim_after_cross = False
+        self.use_flan_t5_decoder = hasattr(self.task_config, "llm_model") and \
+            str(getattr(self.task_config, "llm_model", "")).strip() != ""
+        self.decoder_vocab_size = self.bert_config.vocab_size
         if self._stage_one and check_attr('train_sim_after_cross', self.task_config):
             self.train_sim_after_cross = True
             show_log(task_config, "Test retrieval after cross encoder.")
@@ -155,9 +162,27 @@ class UniVL(UniVLPreTrainedModel):
 
             if self.train_sim_after_cross is False:
                 # Decoder ===>
-                decoder_config = update_attr("decoder_config", decoder_config, "num_decoder_layers",
-                                           self.task_config, "decoder_num_hidden_layers")
-                self.decoder = DecoderModel(decoder_config, bert_word_embeddings_weight, bert_position_embeddings_weight)
+                if self.use_flan_t5_decoder:
+                    if FlanT5Decoder is None:
+                        raise ImportError("FlanT5Decoder dependencies are missing. Please install transformers/peft/accelerate.")
+                    llm_model = getattr(self.task_config, "llm_model", "google/flan-t5-base")
+                    use_lora = bool(getattr(self.task_config, "use_lora", True))
+                    lora_r = int(getattr(self.task_config, "lora_r", 8))
+                    lora_alpha = int(getattr(self.task_config, "lora_alpha", 16))
+                    lora_dropout = float(getattr(self.task_config, "lora_dropout", 0.05))
+                    self.decoder = FlanT5Decoder(
+                        model_name=llm_model,
+                        encoder_hidden_size=cross_config.hidden_size,
+                        use_lora=use_lora,
+                        lora_r=lora_r,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                    )
+                    self.decoder_vocab_size = self.decoder.vocab_size
+                else:
+                    decoder_config = update_attr("decoder_config", decoder_config, "num_decoder_layers",
+                                               self.task_config, "decoder_num_hidden_layers")
+                    self.decoder = DecoderModel(decoder_config, bert_word_embeddings_weight, bert_position_embeddings_weight)
                 # <=== End of Decoder
 
             if self.task_config.do_pretrain:
@@ -242,16 +267,32 @@ class UniVL(UniVLPreTrainedModel):
                     if self.task_config.do_pretrain:
                         decoder_scores, res_tuples = self._get_decoder_score(sequence_output_alm, visual_output_alm,
                                                                              input_ids, attention_mask, video_mask,
-                                                                             input_caption_ids, decoder_mask, shaped=True)
+                                                                             input_caption_ids, decoder_mask,
+                                                                             shaped=True, output_caption_ids=output_caption_ids)
                     elif self.task_config.task_type == "caption":
                         decoder_scores, res_tuples = self._get_decoder_score(sequence_output, visual_output,
                                                                              input_ids, attention_mask, video_mask,
-                                                                             input_caption_ids, decoder_mask, shaped=True)
+                                                                             input_caption_ids, decoder_mask,
+                                                                             shaped=True, output_caption_ids=output_caption_ids)
                     else:
                         raise NotImplementedError
 
                     output_caption_ids = output_caption_ids.view(-1, output_caption_ids.shape[-1])
-                    decoder_loss = self.decoder_loss_fct(decoder_scores.view(-1, self.bert_config.vocab_size), output_caption_ids.view(-1))
+                    if self.use_flan_t5_decoder:
+                        decoder_loss = res_tuples[0] if len(res_tuples) > 0 else None
+                        if decoder_loss is None:
+                            output_caption_ids_safe = output_caption_ids.masked_fill(output_caption_ids == 0, -1)
+                            decoder_loss = self.decoder_loss_fct(
+                                decoder_scores.view(-1, self.decoder_vocab_size),
+                                output_caption_ids_safe.view(-1)
+                            )
+                    else:
+                        decoder_loss = self.decoder_loss_fct(
+                            decoder_scores.view(-1, self.bert_config.vocab_size),
+                            output_caption_ids.view(-1)
+                        )
+                    if torch.isnan(decoder_loss):
+                        decoder_loss = torch.zeros_like(decoder_loss)
                     loss += decoder_loss
 
                 if self.task_config.do_pretrain or self.task_config.task_type == "retrieval":
@@ -276,9 +317,19 @@ class UniVL(UniVLPreTrainedModel):
                 self.task_config.task_type == "caption"):
                 decoder_scores, res_tuples = self._get_decoder_score(sequence_output, visual_output,
                                                                      input_ids, attention_mask, video_mask,
-                                                                     input_caption_ids, decoder_mask, shaped=True)
+                                                                     input_caption_ids, decoder_mask,
+                                                                     shaped=True, output_caption_ids=output_caption_ids)
                 output_caption_ids = output_caption_ids.view(-1, output_caption_ids.shape[-1])
-                decoder_loss = self.decoder_loss_fct(decoder_scores.view(-1, self.bert_config.vocab_size), output_caption_ids.view(-1))
+                if self.use_flan_t5_decoder:
+                    decoder_loss = res_tuples[0] if len(res_tuples) > 0 else None
+                    if decoder_loss is None:
+                        output_caption_ids_safe = output_caption_ids.masked_fill(output_caption_ids == 0, -1)
+                        decoder_loss = self.decoder_loss_fct(
+                            decoder_scores.view(-1, self.decoder_vocab_size),
+                            output_caption_ids_safe.view(-1)
+                        )
+                else:
+                    decoder_loss = self.decoder_loss_fct(decoder_scores.view(-1, self.bert_config.vocab_size), output_caption_ids.view(-1))
                 return decoder_loss
             else:
                 return None
@@ -403,7 +454,8 @@ class UniVL(UniVLPreTrainedModel):
 
         return retrieve_logits
 
-    def _get_decoder_score(self, sequence_output, visual_output, input_ids, attention_mask, video_mask, input_caption_ids, decoder_mask, shaped=False):
+    def _get_decoder_score(self, sequence_output, visual_output, input_ids, attention_mask, video_mask,
+                           input_caption_ids, decoder_mask, shaped=False, output_caption_ids=None):
 
         if shaped is False:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
@@ -415,7 +467,20 @@ class UniVL(UniVLPreTrainedModel):
 
         res_tuples = ()
         cross_output, pooled_output, concat_mask = self._get_cross_output(sequence_output, visual_output, attention_mask, video_mask)
-        decoder_scores = self.decoder(input_caption_ids, encoder_outs=cross_output, answer_mask=decoder_mask, encoder_mask=concat_mask)
+        if self.use_flan_t5_decoder:
+            labels = None
+            if output_caption_ids is not None:
+                labels = output_caption_ids.view(-1, output_caption_ids.shape[-1])
+            decoder_scores, decoder_loss = self.decoder(
+                input_caption_ids,
+                encoder_outs=cross_output,
+                answer_mask=decoder_mask,
+                encoder_mask=concat_mask,
+                labels=labels,
+            )
+            res_tuples = (decoder_loss,)
+        else:
+            decoder_scores = self.decoder(input_caption_ids, encoder_outs=cross_output, answer_mask=decoder_mask, encoder_mask=concat_mask)
 
         return decoder_scores, res_tuples
 

@@ -21,10 +21,33 @@ class Constants():
     @classmethod
     def from_tokenizer(cls, tokenizer):
         instance = cls()
-        instance.PAD = tokenizer.vocab[instance.PAD_WORD]
-        instance.UNK = tokenizer.vocab[instance.UNK_WORD]
-        instance.BOS = tokenizer.vocab[instance.BOS_WORD]
-        instance.EOS = tokenizer.vocab[instance.EOS_WORD]
+        if hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
+            instance.PAD = int(tokenizer.pad_token_id)
+        elif hasattr(tokenizer, "vocab") and instance.PAD_WORD in tokenizer.vocab:
+            instance.PAD = tokenizer.vocab[instance.PAD_WORD]
+
+        if hasattr(tokenizer, "unk_token_id") and tokenizer.unk_token_id is not None:
+            instance.UNK = int(tokenizer.unk_token_id)
+        elif hasattr(tokenizer, "vocab") and instance.UNK_WORD in tokenizer.vocab:
+            instance.UNK = tokenizer.vocab[instance.UNK_WORD]
+
+        if hasattr(tokenizer, "cls_token_id") and tokenizer.cls_token_id is not None:
+            instance.BOS = int(tokenizer.cls_token_id)
+        elif hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None:
+            instance.BOS = int(tokenizer.bos_token_id)
+        elif hasattr(tokenizer, "vocab") and instance.BOS_WORD in tokenizer.vocab:
+            instance.BOS = tokenizer.vocab[instance.BOS_WORD]
+        else:
+            instance.BOS = instance.PAD
+
+        if hasattr(tokenizer, "sep_token_id") and tokenizer.sep_token_id is not None:
+            instance.EOS = int(tokenizer.sep_token_id)
+        elif hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            instance.EOS = int(tokenizer.eos_token_id)
+        elif hasattr(tokenizer, "vocab") and instance.EOS_WORD in tokenizer.vocab:
+            instance.EOS = tokenizer.vocab[instance.EOS_WORD]
+        else:
+            instance.EOS = instance.PAD
         return instance
 
 class Beam():

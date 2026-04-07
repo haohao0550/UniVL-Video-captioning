@@ -3,3 +3,6 @@ tqdm
 boto3
 requests
 pandas
+transformers
+peft
+accelerate

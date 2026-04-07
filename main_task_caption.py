@@ -6,6 +6,7 @@ from __future__ import print_function
 import torch
 import os
 import argparse
+from transformers import AutoTokenizer
 
 from metrics import CaptionEvaluator, PYCOCOEVALCAP_AVAILABLE
 from modules.tokenization import BertTokenizer
@@ -17,9 +18,14 @@ from data.dataloader_factory import DATALOADER_DICT
 from trainers.trainer import train_epoch
 from inference.caption_generator import eval_epoch
 
-# Initialize distributed training only if environment is properly configured
-if not torch.distributed.is_initialized():
-    torch.distributed.init_process_group(backend="nccl")
+# Initialize distributed training only when launched in distributed mode
+if (
+    not torch.distributed.is_initialized()
+    and "WORLD_SIZE" in os.environ
+    and int(os.environ.get("WORLD_SIZE", "1")) > 1
+):
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    torch.distributed.init_process_group(backend=backend)
 
 
 def get_args(description='UniVL on Caption Task'):
@@ -59,6 +65,13 @@ def get_args(description='UniVL on Caption Task'):
     parser.add_argument("--visual_model", default="visual-base", type=str, required=False, help="Visual module")
     parser.add_argument("--cross_model", default="cross-base", type=str, required=False, help="Cross module")
     parser.add_argument("--decoder_model", default="decoder-base", type=str, required=False, help="Decoder module")
+    parser.add_argument("--llm_model", default="", type=str, required=False,
+                        help="Use HuggingFace seq2seq decoder, e.g. google/flan-t5-base")
+    parser.add_argument("--use_lora", action='store_true',
+                        help="Enable LoRA for Flan-T5 decoder")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
     parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
     parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
@@ -112,7 +125,12 @@ def main():
     args, logger = set_seed_logger(args)
     device, n_gpu = init_device(args, args.local_rank, logger)
 
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    if args.llm_model:
+        tokenizer = AutoTokenizer.from_pretrained(args.llm_model, use_fast=True)
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+    else:
+        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     model = init_model(args, device, n_gpu, args.local_rank)
 
     assert args.task_type == "caption"

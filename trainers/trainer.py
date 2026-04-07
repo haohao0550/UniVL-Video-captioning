@@ -28,6 +28,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         if args.gradient_accumulation_steps > 1:
             loss = loss / args.gradient_accumulation_steps
 
+        if torch.isnan(loss) or torch.isinf(loss):
+            if local_rank == 0:
+                logger.warning("NaN/Inf loss detected at step %d, skip this batch.", step + 1)
+            optimizer.zero_grad()
+            continue
+
         loss.backward()
 
         total_loss += float(loss)

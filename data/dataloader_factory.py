@@ -20,7 +20,7 @@ def dataloader_youcook_train(args, tokenizer):
         youcook_dataset,
         batch_size=args.batch_size // args.n_gpu,
         num_workers=args.num_thread_reader,
-        pin_memory=False,
+        pin_memory=True,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         drop_last=True,
@@ -46,7 +46,7 @@ def dataloader_youcook_test(args, tokenizer, logger):
         sampler=test_sampler,
         batch_size=args.batch_size_val,
         num_workers=args.num_thread_reader,
-        pin_memory=False,
+        pin_memory=True,
     )
 
     if args.local_rank == 0:
@@ -71,7 +71,7 @@ def dataloader_msrvtt_train(args, tokenizer):
         msrvtt_dataset,
         batch_size=args.batch_size // args.n_gpu,
         num_workers=args.num_thread_reader,
-        pin_memory=False,
+        pin_memory=True,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         drop_last=True,
@@ -98,7 +98,7 @@ def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test"):
         sampler=test_sampler,
         batch_size=args.batch_size_val,
         num_workers=args.num_thread_reader,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=False,
     )
     return dataloader_msrvtt, len(msrvtt_testset)

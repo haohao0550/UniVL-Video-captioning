@@ -3,6 +3,12 @@ import os
 
 
 def decode_tokens_to_text(token_ids: List[int], tokenizer: Any) -> str:
+    if hasattr(tokenizer, "decode"):
+        try:
+            return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+        except Exception:
+            pass
+
     decode_text_list = tokenizer.convert_ids_to_tokens(token_ids)
     
     # Remove special tokens
