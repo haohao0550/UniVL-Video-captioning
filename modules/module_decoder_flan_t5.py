@@ -57,8 +57,16 @@ class FlanT5Decoder(nn.Module):
         encoder_outs = self.encoder_proj(encoder_outs)
         labels = self._build_labels(labels, answer_mask)
 
+        decoder_input_ids = input_ids
+        if decoder_input_ids is not None:
+            decoder_input_ids = decoder_input_ids.long()
+        if answer_mask is not None:
+            answer_mask = answer_mask.long()
+        if encoder_mask is not None:
+            encoder_mask = encoder_mask.long()
+
         outputs = self.model(
-            input_ids=input_ids,
+            decoder_input_ids=decoder_input_ids,
             attention_mask=encoder_mask,
             encoder_outputs=(encoder_outs,),
             decoder_attention_mask=answer_mask,
