@@ -10,14 +10,34 @@ def set_seed_logger(args):
     os.environ['PYTHONHASHSEED'] = str(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-    world_size = torch.distributed.get_world_size()
-    torch.cuda.set_device(args.local_rank)
-    args.world_size = world_size
+    # Safe distributed setup:
+    # 1) never call get_world_size before init_process_group
+    # 2) initialize only when launched by torchrun (WORLD_SIZE > 1)
+    # 3) fallback to single process world_size=1
+    if not hasattr(args, 'local_rank') or args.local_rank is None:
+        args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    if torch.distributed.is_available():
+        if world_size_env > 1 and not torch.distributed.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            torch.distributed.init_process_group(backend=backend)
+
+        if torch.distributed.is_initialized():
+            args.world_size = torch.distributed.get_world_size()
+        else:
+            args.world_size = 1
+    else:
+        args.world_size = 1
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
