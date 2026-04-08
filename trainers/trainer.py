@@ -9,6 +9,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
+    is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
 
     for step, batch in enumerate(train_dataloader):
         batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
@@ -16,6 +17,21 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         input_ids, input_mask, segment_ids, video, video_mask, \
         pairs_masked_text, pairs_token_labels, masked_video, video_labels_index,\
         pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids = batch
+
+        # Ensure same effective batch shape across ranks to avoid collective mismatch/hang.
+        if is_distributed:
+            local_bs = torch.tensor([input_ids.size(0)], device=device, dtype=torch.long)
+            bs_min = local_bs.clone()
+            bs_max = local_bs.clone()
+            torch.distributed.all_reduce(bs_min, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(bs_max, op=torch.distributed.ReduceOp.MAX)
+            if bs_min.item() != bs_max.item():
+                raise RuntimeError(
+                    "Batch size mismatch across ranks detected: min={}, max={}. "
+                    "Use DistributedSampler + drop_last=True for all training ranks.".format(
+                        bs_min.item(), bs_max.item()
+                    )
+                )
 
         loss = model(input_ids, segment_ids, input_mask, video, video_mask,
                      pairs_masked_text=pairs_masked_text, pairs_token_labels=pairs_token_labels,
@@ -36,7 +52,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
         loss.backward()
 
-        total_loss += float(loss)
+        total_loss += loss.detach().float().item()
         if (step + 1) % args.gradient_accumulation_steps == 0:
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -52,7 +68,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                 logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.6f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
-                            float(loss),
+                            loss.detach().float().item(),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
 

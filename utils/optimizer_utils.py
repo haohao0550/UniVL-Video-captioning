@@ -6,7 +6,14 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
     if hasattr(model, 'module'):
         model = model.module
 
-    param_optimizer = list(model.named_parameters())
+    # LoRA must be injected before DDP wrapping.
+    # If LoRA is enabled, only trainable LoRA (and required adapter/proj) params should be optimized.
+    if getattr(args, 'llm_model', '') and getattr(args, 'use_lora', False):
+        trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        if len(trainable_named_params) == 0:
+            raise RuntimeError("No trainable parameters found while use_lora=True. Ensure LoRA is applied before DDP.")
+
+    param_optimizer = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
     no_decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]

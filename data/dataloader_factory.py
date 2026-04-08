@@ -47,6 +47,7 @@ def dataloader_youcook_test(args, tokenizer, logger):
         batch_size=args.batch_size_val,
         num_workers=args.num_thread_reader,
         pin_memory=True,
+        drop_last=True,
     )
 
     if args.local_rank == 0:
@@ -99,7 +100,7 @@ def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test"):
         batch_size=args.batch_size_val,
         num_workers=args.num_thread_reader,
         pin_memory=True,
-        drop_last=False,
+        drop_last=True,
     )
     return dataloader_msrvtt, len(msrvtt_testset)
 

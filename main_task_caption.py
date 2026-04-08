@@ -6,6 +6,7 @@ from __future__ import print_function
 import torch
 import os
 import argparse
+from datetime import timedelta
 from transformers import AutoTokenizer
 
 from metrics import CaptionEvaluator, PYCOCOEVALCAP_AVAILABLE
@@ -25,7 +26,9 @@ if (
     and int(os.environ.get("WORLD_SIZE", "1")) > 1
 ):
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    torch.distributed.init_process_group(backend=backend)
+    # Long eval on rank0 can make other ranks wait for sync points >10 minutes.
+    # Increase timeout to avoid NCCL watchdog timeout at epoch boundaries.
+    torch.distributed.init_process_group(backend=backend, timeout=timedelta(hours=3))
 
 
 def get_args(description='UniVL on Caption Task'):
@@ -133,6 +136,7 @@ def main():
         tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     model = init_model(args, device, n_gpu, args.local_rank)
     is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    dist_rank = torch.distributed.get_rank() if is_distributed else 0
 
     assert args.task_type == "caption"
     
@@ -147,7 +151,7 @@ def main():
 
     assert args.datatype in DATALOADER_DICT
     test_dataloader, test_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer, logger)
-    if args.local_rank == 0:
+    if dist_rank == 0:
         logger.info("***** Running test *****")
         logger.info("  Num examples = %d", test_length)
         logger.info("  Batch size = %d", args.batch_size_val)
@@ -163,7 +167,7 @@ def main():
             coef_lr = 1.0
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
 
-        if args.local_rank == 0:
+        if dist_rank == 0:
             logger.info("***** Running training *****")
             logger.info("  Num examples = %d", train_length)
             logger.info("  Batch size = %d", args.batch_size)
@@ -179,11 +183,23 @@ def main():
                                                scheduler, global_step, logger, local_rank=args.local_rank)
 
             if is_distributed:
-                torch.distributed.barrier()
+                if torch.cuda.is_available():
+                    torch.distributed.barrier(device_ids=[args.local_rank])
+                else:
+                    torch.distributed.barrier()
 
-            if args.local_rank == 0:
+            if dist_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
                 output_model_file = save_model(epoch, args, model, logger, type_name="")
+
+            # barrier right after save
+            if is_distributed:
+                if torch.cuda.is_available():
+                    torch.distributed.barrier(device_ids=[args.local_rank])
+                else:
+                    torch.distributed.barrier()
+
+            if dist_rank == 0:
                 if epoch >= 0:
                     Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
                     if best_score <= Bleu_4:
@@ -193,16 +209,23 @@ def main():
                 else:
                     logger.warning("Skip the evaluation after {}-th epoch.".format(epoch+1))
 
+            # barrier right after eval
             if is_distributed:
-                torch.distributed.barrier()
+                if torch.cuda.is_available():
+                    torch.distributed.barrier(device_ids=[args.local_rank])
+                else:
+                    torch.distributed.barrier()
 
-        if args.local_rank == 0:
+        if dist_rank == 0:
             model = load_model(-1, args, n_gpu, device, logger, model_file=best_output_model_file)
             Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
         if is_distributed:
-            torch.distributed.barrier()
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[args.local_rank])
+            else:
+                torch.distributed.barrier()
     elif args.do_eval:
-        if args.local_rank == 0:
+        if dist_rank == 0:
             Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
 
 
