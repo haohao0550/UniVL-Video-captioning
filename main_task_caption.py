@@ -90,6 +90,17 @@ def get_args(description='UniVL on Caption Task'):
     parser.add_argument('--cross_num_hidden_layers', type=int, default=2, help="Layer NO. of cross.")
     parser.add_argument('--decoder_num_hidden_layers', type=int, default=3, help="Layer NO. of decoder.")
 
+    parser.add_argument('--freeze_vit', action='store_true', help="Freeze vision encoder parameters.")
+    parser.add_argument('--scst', action='store_true', help="Enable SCST training for caption loss.")
+    parser.add_argument('--beam_size', type=int, default=5, help="Beam size for SCST decoding.")
+    parser.add_argument('--t5_model', type=str, default='google/flan-t5-xl', help="T5 model name.")
+    parser.add_argument('--max_txt_len', type=int, default=32, help="Maximum text length for T5 tokenizer.")
+    parser.add_argument('--num_query_token', type=int, default=32, help="Number of Qformer query tokens.")
+    parser.add_argument('--lora', action='store_true', help="Enable LoRA for T5.")
+    parser.add_argument('--lora_r', type=int, default=16, help="LoRA rank.")
+    parser.add_argument('--lora_alpha', type=int, default=32, help="LoRA alpha.")
+    parser.add_argument('--lora_dropout', type=float, default=0.05, help="LoRA dropout.")
+
     parser.add_argument('--stage_two', action='store_true', help="Whether training with decoder.")
     args = parser.parse_args()
 
