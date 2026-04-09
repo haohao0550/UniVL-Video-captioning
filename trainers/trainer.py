@@ -15,13 +15,15 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
         input_ids, input_mask, segment_ids, video, video_mask, \
         pairs_masked_text, pairs_token_labels, masked_video, video_labels_index,\
-        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids = batch
+        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
+        pairs_t5_output_caption_ids = batch
 
         loss = model(input_ids, segment_ids, input_mask, video, video_mask,
                      pairs_masked_text=pairs_masked_text, pairs_token_labels=pairs_token_labels,
                      masked_video=masked_video, video_labels_index=video_labels_index,
                      input_caption_ids=pairs_input_caption_ids, decoder_mask=pairs_decoder_mask,
-                     output_caption_ids=pairs_output_caption_ids)
+                     output_caption_ids=pairs_output_caption_ids,
+                     t5_output_caption_ids=pairs_t5_output_caption_ids)
 
         if n_gpu > 1:
             loss = loss.mean()

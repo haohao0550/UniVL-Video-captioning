@@ -13,4 +13,5 @@ main_task_caption.py \
 --batch_size_val 32 --visual_num_hidden_layers 6 \
 --freeze_vit \
 --init_model weight/univl.pretrained.bin \
+--video_dim 768 \
 --gradient_accumulation_steps=2

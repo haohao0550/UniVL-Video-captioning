@@ -126,6 +126,9 @@ def main():
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     model = init_model(args, device, n_gpu, args.local_rank)
 
+    # Get T5 tokenizer from model for dataloader T5 tokenization (used by SCST)
+    t5_tokenizer = getattr(model, 't5_tokenizer', None)
+
     assert args.task_type == "caption"
     
     if PYCOCOEVALCAP_AVAILABLE:
@@ -138,7 +141,7 @@ def main():
             logger.warning("pycocoevalcap not available. Evaluation metrics will be skipped.")
 
     assert args.datatype in DATALOADER_DICT
-    test_dataloader, test_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer, logger)
+    test_dataloader, test_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer, logger, t5_tokenizer=t5_tokenizer)
     if args.local_rank == 0:
         logger.info("***** Running test *****")
         logger.info("  Num examples = %d", test_length)
@@ -146,7 +149,7 @@ def main():
         logger.info("  Num steps = %d", len(test_dataloader))
 
     if args.do_train:
-        train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
+        train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer, t5_tokenizer=t5_tokenizer)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
 
@@ -174,20 +177,20 @@ def main():
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
                 output_model_file = save_model(epoch, args, model, logger, type_name="")
                 if epoch >= 0:
-                    Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
-                    if best_score <= Bleu_4:
-                        best_score = Bleu_4
+                    CIDEr, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
+                    if best_score <= CIDEr:
+                        best_score = CIDEr
                         best_output_model_file = output_model_file
-                    logger.info("The best model is: {}, the Bleu_4 is: {:.4f}".format(best_output_model_file, best_score))
+                    logger.info("The best model is: {}, the CIDEr is: {:.4f}".format(best_output_model_file, best_score))
                 else:
                     logger.warning("Skip the evaluation after {}-th epoch.".format(epoch+1))
 
         if args.local_rank == 0:
             model = load_model(-1, args, n_gpu, device, logger, model_file=best_output_model_file)
-            Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
+            CIDEr, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
     elif args.do_eval:
         if args.local_rank == 0:
-            Bleu_4, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
+            CIDEr, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
 
 
 if __name__ == "__main__":

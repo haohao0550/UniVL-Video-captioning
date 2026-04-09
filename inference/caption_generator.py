@@ -1,5 +1,6 @@
 import torch
 from inference.eval_utils import decode_tokens_to_text, save_predictions, save_complete_results, log_metrics
+from tasks.pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
 
 
 def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=None, test_set=None):
@@ -18,7 +19,8 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, n
 
         input_ids, input_mask, segment_ids, video, video_mask, \
         pairs_masked_text, pairs_token_labels, masked_video, video_labels_index, \
-        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids = batch
+        pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
+        pairs_t5_output_caption_ids = batch
 
         with torch.no_grad():
             # Calculate validation loss
@@ -28,7 +30,8 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, n
                         pairs_masked_text=pairs_masked_text, pairs_token_labels=pairs_token_labels,
                         masked_video=masked_video, video_labels_index=video_labels_index,
                         input_caption_ids=pairs_input_caption_ids, decoder_mask=pairs_decoder_mask,
-                        output_caption_ids=pairs_output_caption_ids)
+                        output_caption_ids=pairs_output_caption_ids,
+                        t5_output_caption_ids=pairs_t5_output_caption_ids)
             if loss is not None:
                 if n_gpu > 1:
                     loss = loss.mean()
@@ -73,11 +76,38 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, n
         all_caption_lists = [all_caption_lists]
 
     if nlgEvalObj is not None:
-        metrics_nlg = nlgEvalObj.compute_metrics(ref_list=all_caption_lists, hyp_list=all_result_lists)
+        # Apply PTBTokenizer for consistency with SCST training CIDEr computation
+        ptb_tokenizer = PTBTokenizer()
+
+        # Tokenize predictions
+        cands_dict = {idx: [{'caption': c}] for idx, c in enumerate(all_result_lists)}
+        cands_tokenized = ptb_tokenizer.tokenize(cands_dict)
+        hyp_list_tokenized = [cands_tokenized[idx][0] for idx in range(len(all_result_lists))]
+
+        # Tokenize references
+        if isinstance(all_caption_lists[0], list):
+            # Multiple reference sets (e.g., MSRVTT)
+            refs_dict = {}
+            for idx in range(len(all_caption_lists[0])):
+                refs_dict[idx] = [{'caption': all_caption_lists[j][idx]}
+                                  for j in range(len(all_caption_lists))]
+            refs_tokenized = ptb_tokenizer.tokenize(refs_dict)
+            ref_list_tokenized = []
+            for j in range(len(all_caption_lists)):
+                ref_list_tokenized.append(
+                    [refs_tokenized[idx][j] for idx in range(len(all_caption_lists[0]))]
+                )
+        else:
+            # Single reference set (e.g., YoucookII, already wrapped in list)
+            refs_dict = {idx: [{'caption': c}] for idx, c in enumerate(all_caption_lists[0])}
+            refs_tokenized = ptb_tokenizer.tokenize(refs_dict)
+            ref_list_tokenized = [[refs_tokenized[idx][0] for idx in range(len(all_caption_lists[0]))]]
+
+        metrics_nlg = nlgEvalObj.compute_metrics(ref_list=ref_list_tokenized, hyp_list=hyp_list_tokenized)
         log_metrics(logger, metrics_nlg)
-        Bleu_4 = metrics_nlg["Bleu_4"]
+        CIDEr = metrics_nlg.get("CIDEr", 0.0)
     else:
         logger.warning("Evaluation metrics skipped (pycocoevalcap not available)")
-        Bleu_4 = 0.0
+        CIDEr = 0.0
     
-    return Bleu_4, avg_val_loss
+    return CIDEr, avg_val_loss

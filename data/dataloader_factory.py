@@ -4,7 +4,8 @@ from dataloaders.dataloader_youcook_caption import Youcook_Caption_DataLoader
 from dataloaders.dataloader_msrvtt_caption import MSRVTT_Caption_DataLoader
 
 
-def dataloader_youcook_train(args, tokenizer):
+def dataloader_youcook_train(args, tokenizer, t5_tokenizer=None):
+    max_txt_len = getattr(args, 'max_txt_len', 32)
     youcook_dataset = Youcook_Caption_DataLoader(
         csv=args.train_csv,
         data_path=args.data_path,
@@ -13,6 +14,8 @@ def dataloader_youcook_train(args, tokenizer):
         feature_framerate=args.feature_framerate,
         tokenizer=tokenizer,
         max_frames=args.max_frames,
+        t5_tokenizer=t5_tokenizer,
+        max_txt_len=max_txt_len,
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(youcook_dataset)
@@ -29,7 +32,8 @@ def dataloader_youcook_train(args, tokenizer):
     return dataloader, len(youcook_dataset), train_sampler
 
 
-def dataloader_youcook_test(args, tokenizer, logger):
+def dataloader_youcook_test(args, tokenizer, logger, t5_tokenizer=None):
+    max_txt_len = getattr(args, 'max_txt_len', 32)
     youcook_testset = Youcook_Caption_DataLoader(
         csv=args.val_csv,
         data_path=args.data_path,
@@ -38,6 +42,8 @@ def dataloader_youcook_test(args, tokenizer, logger):
         feature_framerate=args.feature_framerate,
         tokenizer=tokenizer,
         max_frames=args.max_frames,
+        t5_tokenizer=t5_tokenizer,
+        max_txt_len=max_txt_len,
     )
 
     test_sampler = SequentialSampler(youcook_testset)
@@ -54,7 +60,8 @@ def dataloader_youcook_test(args, tokenizer, logger):
     return dataloader_youcook, len(youcook_testset)
 
 
-def dataloader_msrvtt_train(args, tokenizer):
+def dataloader_msrvtt_train(args, tokenizer, t5_tokenizer=None):
+    max_txt_len = getattr(args, 'max_txt_len', 32)
     msrvtt_dataset = MSRVTT_Caption_DataLoader(
         csv_path=args.train_csv,
         json_path=args.data_path,
@@ -64,6 +71,8 @@ def dataloader_msrvtt_train(args, tokenizer):
         tokenizer=tokenizer,
         max_frames=args.max_frames,
         split_type="train",
+        t5_tokenizer=t5_tokenizer,
+        max_txt_len=max_txt_len,
     )
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(msrvtt_dataset)
@@ -80,7 +89,8 @@ def dataloader_msrvtt_train(args, tokenizer):
     return dataloader, len(msrvtt_dataset), train_sampler
 
 
-def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test"):
+def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test", t5_tokenizer=None):
+    max_txt_len = getattr(args, 'max_txt_len', 32)
     msrvtt_testset = MSRVTT_Caption_DataLoader(
         csv_path=args.val_csv,
         json_path=args.data_path,
@@ -90,6 +100,8 @@ def dataloader_msrvtt_test(args, tokenizer, logger=None, split_type="test"):
         tokenizer=tokenizer,
         max_frames=args.max_frames,
         split_type=split_type,
+        t5_tokenizer=t5_tokenizer,
+        max_txt_len=max_txt_len,
     )
 
     test_sampler = SequentialSampler(msrvtt_testset)

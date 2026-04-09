@@ -259,7 +259,8 @@ class UniVL(UniVLPreTrainedModel):
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None,
                 pairs_masked_text=None, pairs_token_labels=None, masked_video=None, video_labels_index=None,
-                input_caption_ids=None, decoder_mask=None, output_caption_ids=None):
+                input_caption_ids=None, decoder_mask=None, output_caption_ids=None,
+                t5_output_caption_ids=None):
 
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
@@ -325,11 +326,13 @@ class UniVL(UniVLPreTrainedModel):
                     if self.task_config.do_pretrain:
                         decoder_loss = self._get_t5_caption_loss(visual_output_alm,
                                                                  video_mask,
-                                                                 output_caption_ids)
+                                                                 output_caption_ids,
+                                                                 t5_output_caption_ids)
                     elif self.task_config.task_type == "caption":
                         decoder_loss = self._get_t5_caption_loss(visual_output,
                                                                  video_mask,
-                                                                 output_caption_ids)
+                                                                 output_caption_ids,
+                                                                 t5_output_caption_ids)
                     else:
                         raise NotImplementedError
                     loss += decoder_loss
@@ -471,7 +474,7 @@ class UniVL(UniVLPreTrainedModel):
         )
         return outputs.loss
 
-    def _compute_scst_caption_loss(self, inputs_embeds, encoder_atts, output_caption_ids):
+    def _compute_scst_caption_loss(self, inputs_embeds, encoder_atts, output_caption_ids, t5_output_caption_ids=None):
         from tasks.pycocoevalcap.cider.cider import Cider
 
         outputs = self.t5_model.generate(
@@ -501,8 +504,14 @@ class UniVL(UniVLPreTrainedModel):
         caps_gen = self.t5_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
         caps_gen = [text.strip() for text in caps_gen]
 
+        # Use T5-tokenized GT IDs if available (correct vocab), otherwise
+        # fall back to output_caption_ids (BERT vocab — legacy/incorrect)
+        if t5_output_caption_ids is not None:
+            gt_ids = t5_output_caption_ids
+        else:
+            gt_ids = output_caption_ids
         pad_token_id = self.t5_tokenizer.pad_token_id
-        gt_tokens = output_caption_ids.clone().masked_fill(output_caption_ids.lt(0), pad_token_id)
+        gt_tokens = gt_ids.clone().masked_fill(gt_ids.lt(0), pad_token_id)
         caps_gt = self.t5_tokenizer.batch_decode(gt_tokens, skip_special_tokens=True)
         caps_gt = list(itertools.chain(*([c] * self.beam_size for c in caps_gt)))
         caps_gt = [[c] for c in caps_gt]
@@ -515,18 +524,20 @@ class UniVL(UniVLPreTrainedModel):
         loss = -(sequences_scores) * (reward - reward_baseline)
         return loss.mean()
 
-    def _get_t5_caption_loss(self, visual_output, video_mask, output_caption_ids):
+    def _get_t5_caption_loss(self, visual_output, video_mask, output_caption_ids, t5_output_caption_ids=None):
         if output_caption_ids is None:
             return torch.tensor(0.0, device=visual_output.device)
 
         output_caption_ids = output_caption_ids.view(-1, output_caption_ids.shape[-1])
+        if t5_output_caption_ids is not None:
+            t5_output_caption_ids = t5_output_caption_ids.view(-1, t5_output_caption_ids.shape[-1])
 
-        with torch.amp.autocast(dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
             inputs_embeds, encoder_atts = self._build_t5_encoder_inputs(
                 visual_output, video_mask
             )
             if self.training and getattr(self, "scst", False):
-                return self._compute_scst_caption_loss(inputs_embeds, encoder_atts, output_caption_ids)
+                return self._compute_scst_caption_loss(inputs_embeds, encoder_atts, output_caption_ids, t5_output_caption_ids)
             return self._compute_xe_caption_loss(inputs_embeds, encoder_atts, output_caption_ids)
 
     def generate_caption_ids(self, visual_output, video_mask, num_beams=None, max_length=None):
