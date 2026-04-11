@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_dim", type=int, default=768)
     parser.add_argument("--max_txt_len", type=int, default=24)
     parser.add_argument("--num_query_token", type=int, default=8)
+    parser.add_argument("--qformer_vision_width", type=int, default=768)
+    parser.add_argument("--qformer_checkpoint", default="")
+    parser.add_argument("--qformer_checkpoint_file", default="")
+    parser.add_argument("--qformer_checkpoint_local_files_only", action="store_true")
     parser.add_argument("--visual_num_hidden_layers", type=int, default=1)
     parser.add_argument("--cross_num_hidden_layers", type=int, default=1)
     parser.add_argument("--text_num_hidden_layers", type=int, default=1)
@@ -154,6 +158,10 @@ def make_task_config(args: argparse.Namespace, device: torch.device) -> SimpleNa
         t5_model=args.t5_model,
         max_txt_len=args.max_txt_len,
         num_query_token=args.num_query_token,
+        qformer_vision_width=args.qformer_vision_width,
+        qformer_checkpoint=args.qformer_checkpoint,
+        qformer_checkpoint_file=args.qformer_checkpoint_file,
+        qformer_checkpoint_local_files_only=args.qformer_checkpoint_local_files_only,
         lora=args.lora,
         lora_r=8,
         lora_alpha=16,

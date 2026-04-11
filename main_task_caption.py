@@ -96,6 +96,14 @@ def get_args(description='UniVL on Caption Task'):
     parser.add_argument('--t5_model', type=str, default='google/flan-t5-xl', help="T5 model name.")
     parser.add_argument('--max_txt_len', type=int, default=32, help="Maximum text length for T5 tokenizer.")
     parser.add_argument('--num_query_token', type=int, default=32, help="Number of Qformer query tokens.")
+    parser.add_argument('--qformer_vision_width', type=int, default=768,
+                        help="Encoder feature width expected by QFormer cross-attention.")
+    parser.add_argument('--qformer_checkpoint', type=str, default='',
+                        help="Optional local path or Hugging Face repo id for QFormer weights.")
+    parser.add_argument('--qformer_checkpoint_file', type=str, default='',
+                        help="Optional exact checkpoint filename inside the QFormer checkpoint repo/path.")
+    parser.add_argument('--qformer_checkpoint_local_files_only', action='store_true',
+                        help="Load QFormer checkpoint from local Hugging Face cache only.")
     parser.add_argument('--lora', action='store_true', help="Enable LoRA for T5.")
     parser.add_argument('--lora_r', type=int, default=16, help="LoRA rank.")
     parser.add_argument('--lora_alpha', type=int, default=32, help="LoRA alpha.")

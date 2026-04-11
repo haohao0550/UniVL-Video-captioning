@@ -183,8 +183,23 @@ class UniVL(UniVLPreTrainedModel):
                                         self.task_config, "cross_num_hidden_layers")
             self.cross = CrossModel(cross_config)
             self.num_query_token = getattr(self.task_config, "num_query_token", 32)
+            self.qformer_vision_width = getattr(self.task_config, "qformer_vision_width", visual_config.hidden_size)
+            if self.qformer_vision_width != visual_config.hidden_size:
+                self.qformer_visual_proj = nn.Linear(visual_config.hidden_size, self.qformer_vision_width)
+                show_log(
+                    task_config,
+                    "Add QFormer visual projection: {} -> {}.".format(
+                        visual_config.hidden_size, self.qformer_vision_width
+                    )
+                )
+            else:
+                self.qformer_visual_proj = nn.Identity()
             self.Qformer, self.query_tokens = Blip2Base.init_Qformer(
-                self.num_query_token, visual_config.hidden_size
+                self.num_query_token,
+                self.qformer_vision_width,
+                qformer_checkpoint=getattr(self.task_config, "qformer_checkpoint", None),
+                qformer_checkpoint_file=getattr(self.task_config, "qformer_checkpoint_file", None),
+                local_files_only=getattr(self.task_config, "qformer_checkpoint_local_files_only", False),
             )
             self.Qformer.cls = None
             self.Qformer.bert.embeddings.word_embeddings = None
@@ -428,7 +443,7 @@ class UniVL(UniVLPreTrainedModel):
             device=visual_output.device,
             dtype=qformer_dtype,
         )
-        visual_for_qformer = visual_output.to(dtype=qformer_dtype)
+        visual_for_qformer = self.qformer_visual_proj(visual_output).to(dtype=qformer_dtype)
         image_atts = video_mask.long()
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,

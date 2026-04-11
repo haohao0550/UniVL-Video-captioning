@@ -5,6 +5,7 @@
  For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 """
 import contextlib
+import json
 import logging
 import os
 import time
@@ -25,11 +26,13 @@ from modules.Qformer import BertConfig, BertLMHeadModel
 # from lavis.models.clip_vit import create_clip_vit_L
 from transformers import BertTokenizer
 
+logger = logging.getLogger(__name__)
+
 
 class Blip2Base(BaseModel):
     @classmethod
     def init_tokenizer(cls, truncation_side="right"):
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", truncation_side=truncation_side, cache_dir="/home/anonymous/new_ssd/cache_dir")
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", truncation_side=truncation_side)
         tokenizer.add_special_tokens({"bos_token": "[DEC]"})
         return tokenizer
 
@@ -44,21 +47,226 @@ class Blip2Base(BaseModel):
             return contextlib.nullcontext()
 
     @classmethod
-    def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):
-        encoder_config = BertConfig.from_pretrained("bert-base-uncased", cache_dir="/home/anonymous/new_ssd/cache_dir")
+    def init_Qformer(
+            cls,
+            num_query_token,
+            vision_width,
+            cross_attention_freq=2,
+            qformer_checkpoint=None,
+            qformer_checkpoint_file=None,
+            local_files_only=False,
+    ):
+        encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.encoder_width = vision_width
         # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True
         encoder_config.cross_attention_freq = cross_attention_freq
         encoder_config.query_length = num_query_token
         Qformer = BertLMHeadModel.from_pretrained(
-            "bert-base-uncased", config=encoder_config, cache_dir="/home/anonymous/new_ssd/cache_dir"
+            "bert-base-uncased", config=encoder_config
         )
         query_tokens = nn.Parameter(
             torch.zeros(1, num_query_token, encoder_config.hidden_size)
         )
         query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        cls.load_qformer_checkpoint(
+            Qformer,
+            query_tokens,
+            qformer_checkpoint,
+            checkpoint_file=qformer_checkpoint_file,
+            local_files_only=local_files_only,
+        )
         return Qformer, query_tokens
+
+    @staticmethod
+    def load_qformer_checkpoint(
+            qformer,
+            query_tokens,
+            checkpoint,
+            checkpoint_file=None,
+            local_files_only=False,
+    ):
+        if not checkpoint:
+            return None
+
+        target_state = qformer.state_dict()
+        qformer_state = {}
+        copied_query_tokens = False
+        skipped = []
+
+        for source_key, tensor in Blip2Base.iter_qformer_checkpoint_tensors(
+                checkpoint,
+                checkpoint_file=checkpoint_file,
+                local_files_only=local_files_only,
+        ):
+            mapped_key = Blip2Base.map_blip2_qformer_key(source_key)
+            if mapped_key is None:
+                continue
+
+            if mapped_key == "query_tokens":
+                if tuple(tensor.shape) == tuple(query_tokens.shape):
+                    query_tokens.data.copy_(tensor.to(dtype=query_tokens.dtype))
+                    copied_query_tokens = True
+                else:
+                    skipped.append((source_key, mapped_key, tuple(tensor.shape), tuple(query_tokens.shape)))
+                continue
+
+            if mapped_key in target_state and tuple(tensor.shape) == tuple(target_state[mapped_key].shape):
+                qformer_state[mapped_key] = tensor.to(dtype=target_state[mapped_key].dtype)
+            elif mapped_key in target_state:
+                skipped.append((source_key, mapped_key, tuple(tensor.shape), tuple(target_state[mapped_key].shape)))
+
+        msg = qformer.load_state_dict(qformer_state, strict=False)
+        logger.info(
+            "Loaded QFormer checkpoint from %s: tensors=%d query_tokens=%s missing=%d unexpected=%d skipped_shape=%d",
+            checkpoint,
+            len(qformer_state),
+            copied_query_tokens,
+            len(msg.missing_keys),
+            len(msg.unexpected_keys),
+            len(skipped),
+        )
+        if skipped:
+            logger.info("First skipped QFormer checkpoint keys: %s", skipped[:10])
+        return msg
+
+    @staticmethod
+    def map_blip2_qformer_key(key):
+        key = key.replace("module.", "")
+
+        query_token_keys = {
+            "query_tokens",
+            "blip2.query_tokens",
+            "model.query_tokens",
+        }
+        if key in query_token_keys or key.endswith(".query_tokens"):
+            return "query_tokens"
+
+        prefixes = (
+            "qformer.",
+            "Qformer.",
+            "blip2.qformer.",
+            "model.qformer.",
+            "blip2opt.qformer.",
+        )
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        else:
+            return None
+
+        if key.startswith(("bert.", "cls.")):
+            return key
+        return "bert." + key
+
+    @staticmethod
+    def iter_qformer_checkpoint_tensors(checkpoint, checkpoint_file=None, local_files_only=False):
+        if os.path.isdir(checkpoint):
+            yield from Blip2Base.iter_local_qformer_checkpoint_tensors(checkpoint, checkpoint_file)
+            return
+        if os.path.isfile(checkpoint):
+            yield from Blip2Base.iter_checkpoint_file_tensors(checkpoint)
+            return
+        yield from Blip2Base.iter_hf_qformer_checkpoint_tensors(
+            checkpoint,
+            checkpoint_file=checkpoint_file,
+            local_files_only=local_files_only,
+        )
+
+    @staticmethod
+    def iter_local_qformer_checkpoint_tensors(checkpoint_dir, checkpoint_file=None):
+        if checkpoint_file:
+            yield from Blip2Base.iter_checkpoint_file_tensors(os.path.join(checkpoint_dir, checkpoint_file))
+            return
+
+        for filename in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            index_path = os.path.join(checkpoint_dir, filename)
+            if os.path.exists(index_path):
+                with open(index_path, "r", encoding="utf-8") as reader:
+                    index = json.load(reader)
+                qformer_files = sorted({
+                    shard for key, shard in index.get("weight_map", {}).items()
+                    if key == "query_tokens" or ".query_tokens" in key or "qformer." in key.lower()
+                })
+                for shard in qformer_files:
+                    yield from Blip2Base.iter_checkpoint_file_tensors(os.path.join(checkpoint_dir, shard))
+                return
+
+        for filename in ("model.safetensors", "pytorch_model.bin"):
+            path = os.path.join(checkpoint_dir, filename)
+            if os.path.exists(path):
+                yield from Blip2Base.iter_checkpoint_file_tensors(path)
+                return
+
+        raise FileNotFoundError("No supported checkpoint file found in {}".format(checkpoint_dir))
+
+    @staticmethod
+    def iter_hf_qformer_checkpoint_tensors(repo_id, checkpoint_file=None, local_files_only=False):
+        from huggingface_hub import hf_hub_download
+
+        if checkpoint_file:
+            path = hf_hub_download(repo_id, checkpoint_file, local_files_only=local_files_only)
+            yield from Blip2Base.iter_checkpoint_file_tensors(path)
+            return
+
+        index_filenames = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+        last_error = None
+        for index_filename in index_filenames:
+            try:
+                index_path = hf_hub_download(repo_id, index_filename, local_files_only=local_files_only)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            with open(index_path, "r", encoding="utf-8") as reader:
+                index = json.load(reader)
+            qformer_files = sorted({
+                shard for key, shard in index.get("weight_map", {}).items()
+                if key == "query_tokens" or ".query_tokens" in key or "qformer." in key.lower()
+            })
+            if not qformer_files:
+                raise RuntimeError("No QFormer keys found in {}".format(index_filename))
+
+            logger.info("QFormer checkpoint shards selected from %s: %s", repo_id, qformer_files)
+            for shard in qformer_files:
+                path = hf_hub_download(repo_id, shard, local_files_only=local_files_only)
+                yield from Blip2Base.iter_checkpoint_file_tensors(path)
+            return
+
+        for filename in ("model.safetensors", "pytorch_model.bin"):
+            try:
+                path = hf_hub_download(repo_id, filename, local_files_only=local_files_only)
+            except Exception as exc:
+                last_error = exc
+                continue
+            yield from Blip2Base.iter_checkpoint_file_tensors(path)
+            return
+
+        raise RuntimeError("Could not resolve Hugging Face checkpoint {}: {}".format(repo_id, last_error))
+
+    @staticmethod
+    def iter_checkpoint_file_tensors(path):
+        if path.endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if key == "query_tokens" or ".query_tokens" in key or "qformer." in key.lower():
+                        yield key, handle.get_tensor(key)
+            return
+
+        checkpoint = torch.load(path, map_location="cpu")
+        if isinstance(checkpoint, dict) and "model" in checkpoint and isinstance(checkpoint["model"], dict):
+            checkpoint = checkpoint["model"]
+        elif isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            checkpoint = checkpoint["state_dict"]
+        if not isinstance(checkpoint, dict):
+            raise TypeError("Unsupported checkpoint type from {}: {}".format(path, type(checkpoint)))
+
+        for key, tensor in checkpoint.items():
+            if torch.is_tensor(tensor) and (key == "query_tokens" or ".query_tokens" in key or "qformer." in key.lower()):
+                yield key, tensor
 
 #     def init_vision_encoder(
 #         self, model_name, img_size, drop_path_rate, use_grad_checkpoint, precision
