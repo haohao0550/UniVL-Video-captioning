@@ -205,7 +205,19 @@ def main():
 
         if args.local_rank == 0:
             model = load_model(-1, args, n_gpu, device, logger, model_file=best_output_model_file)
-            CIDEr, _, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)
+            CIDEr, _, _ = eval_epoch(
+                args,
+                model,
+                test_dataloader,
+                tokenizer,
+                device,
+                n_gpu,
+                logger,
+                nlgEvalObj=nlgEvalObj,
+                pred_filename="hyp_best.txt",
+                ref_filename="ref_best.txt",
+                complete_results_filename="hyp_complete_results_best.txt",
+            )
     elif args.do_eval:
         if args.local_rank == 0:
             CIDEr, _, _ = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=nlgEvalObj)

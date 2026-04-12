@@ -4,7 +4,20 @@ from inference.eval_utils import decode_tokens_to_text, save_predictions, save_c
 from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
 
 
-def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, nlgEvalObj=None, test_set=None):
+def eval_epoch(
+    args,
+    model,
+    test_dataloader,
+    tokenizer,
+    device,
+    n_gpu,
+    logger,
+    nlgEvalObj=None,
+    test_set=None,
+    pred_filename="hyp.txt",
+    ref_filename="ref.txt",
+    complete_results_filename="hyp_complete_results.txt",
+):
     bleu_4 = 0.0
 
     if hasattr(model, 'module'):
@@ -60,11 +73,22 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, logger, n
     avg_val_loss = total_loss / len(test_dataloader)
     logger.info("  Average Validation Loss: {:.4f}".format(avg_val_loss)) 
     
-    complete_results_path = save_complete_results(all_result_lists, test_set, args.output_dir)
+    complete_results_path = save_complete_results(
+        all_result_lists,
+        test_set,
+        args.output_dir,
+        filename=complete_results_filename,
+    )
     if complete_results_path:
         logger.info("File of complete results is saved in {}".format(complete_results_path))
 
-    save_predictions(all_result_lists, all_caption_lists, args.output_dir)
+    save_predictions(
+        all_result_lists,
+        all_caption_lists,
+        args.output_dir,
+        pred_filename=pred_filename,
+        ref_filename=ref_filename,
+    )
 
     if args.datatype == "msrvtt":
         all_caption_lists = []
