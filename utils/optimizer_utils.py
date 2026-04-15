@@ -48,9 +48,13 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
         {'params': [p for n, p in decay_other_param_tp], 'weight_decay': 0.0}
     ]
 
+    # P2: Use constant LR schedule for SCST (RL) training instead of linear decay.
+    # Linear decay drives LR to 0, which is counterproductive for RL fine-tuning.
+    schedule = 'warmup_constant' if getattr(args, 'scst', False) else 'warmup_linear'
+
     scheduler = None
     optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
-                         schedule='warmup_linear', t_total=num_train_optimization_steps, weight_decay=0.01,
+                         schedule=schedule, t_total=num_train_optimization_steps, weight_decay=0.01,
                          max_grad_norm=1.0)
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],

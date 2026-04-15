@@ -13,6 +13,7 @@ from modules.tokenization import BertTokenizer
 from utils.setup_utils import set_seed_logger, init_device
 from utils.model_utils import init_model, save_model, load_model
 from utils.optimizer_utils import prep_optimizer
+from utils.cider_utils import CorpusCider
 from data.dataloader_factory import DATALOADER_DICT
 from trainers.trainer import train_epoch
 from inference.caption_generator import eval_epoch
@@ -168,6 +169,13 @@ def main():
         if args.init_model:
             coef_lr = 1.0
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
+
+        # P1: Pre-compute corpus-level IDF for SCST CIDEr reward
+        if args.scst and hasattr(train_dataloader.dataset, 'video_sentences_dict'):
+            model_inner = model.module if hasattr(model, 'module') else model
+            corpus_cider = CorpusCider()
+            corpus_cider.init_corpus_df(train_dataloader.dataset.video_sentences_dict)
+            model_inner._cider_scorer = corpus_cider
 
         if args.local_rank == 0:
             logger.info("***** Running training *****")
