@@ -31,5 +31,4 @@ dataset-metadata.json
 ckpts/ver_2/
 run.ipynb
 .DS_Store
-data/
 run_final.ipynb
